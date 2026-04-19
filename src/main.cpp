@@ -2,13 +2,15 @@
 
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 void print_usage(const char * program) {
     fprintf(stderr, "Usage: %s [options] -m <model_dir> -t <text>\n", program);
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -m, --model <dir>      Model directory (required)\n");
+    fprintf(stderr, "  -m, --model <path>     Talker gguf file, or directory containing talker+tokenizer ggufs (required)\n");
+    fprintf(stderr, "      --vocoder <file>   Tokenizer/vocoder gguf (required when -m is a file; else auto-discovered)\n");
     fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
@@ -29,7 +31,8 @@ void print_usage(const char * program) {
 }
 
 int main(int argc, char ** argv) {
-    std::string model_dir;
+    std::string model_path;
+    std::string vocoder_path;
     std::string text;
     std::string output_file = "output.wav";
     std::string reference_audio;
@@ -45,10 +48,13 @@ int main(int argc, char ** argv) {
             return 0;
         } else if (arg == "-m" || arg == "--model") {
             if (++i >= argc) {
-                fprintf(stderr, "Error: missing model directory\n");
+                fprintf(stderr, "Error: missing model path\n");
                 return 1;
             }
-            model_dir = argv[i];
+            model_path = argv[i];
+        } else if (arg == "--vocoder") {
+            if (++i >= argc) { fprintf(stderr, "Error: missing vocoder path\n"); return 1; }
+            vocoder_path = argv[i];
         } else if (arg == "-t" || arg == "--text") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing text\n");
@@ -148,9 +154,8 @@ int main(int argc, char ** argv) {
         }
     }
     
-    // Validate required arguments
-    if (model_dir.empty()) {
-        fprintf(stderr, "Error: model directory is required\n");
+    if (model_path.empty()) {
+        fprintf(stderr, "Error: -m <path> is required\n");
         print_usage(argv[0]);
         return 1;
     }
@@ -164,8 +169,21 @@ int main(int argc, char ** argv) {
     // Initialize TTS
     qwen3_tts::Qwen3TTS tts;
     
-    fprintf(stderr, "Loading models from: %s\n", model_dir.c_str());
-    if (!tts.load_models(model_dir)) {
+    bool loaded;
+    bool is_file = std::filesystem::is_regular_file(model_path);
+    if (is_file) {
+        if (vocoder_path.empty()) {
+            fprintf(stderr, "Error: --vocoder <file> is required when -m is a file\n");
+            return 1;
+        }
+        fprintf(stderr, "Loading talker: %s\n", model_path.c_str());
+        fprintf(stderr, "Loading vocoder: %s\n", vocoder_path.c_str());
+        loaded = tts.load_model_files(model_path, vocoder_path);
+    } else {
+        fprintf(stderr, "Loading models from: %s\n", model_path.c_str());
+        loaded = tts.load_models(model_path);
+    }
+    if (!loaded) {
         fprintf(stderr, "Error: %s\n", tts.get_error().c_str());
         return 1;
     }

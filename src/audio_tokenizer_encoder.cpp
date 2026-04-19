@@ -105,13 +105,6 @@ static void compute_dft(const float * input, float * real, float * imag, int n) 
     }
 }
 
-// Periodic Hann window (matches torch.hann_window with periodic=True, which is default)
-static void compute_hann_window(float * window, int n) {
-    for (int i = 0; i < n; ++i) {
-        window[i] = 0.5f * (1.0f - cosf(2.0f * M_PI * i / n));
-    }
-}
-
 // Compute centered window for STFT (PyTorch centers win_length window in n_fft frame)
 static void compute_centered_window(float * window, int n_fft, int win_length) {
     // Zero-initialize
@@ -381,8 +374,8 @@ static struct ggml_tensor * apply_reflect_pad_1d(struct ggml_context * ctx,
     int64_t C = x->ne[1];
     int64_t B = x->ne[2];
     
-    struct ggml_tensor * left_slices[16];
-    struct ggml_tensor * right_slices[16];
+    struct ggml_tensor * left_slices[16] = {};
+    struct ggml_tensor * right_slices[16] = {};
     
     for (int i = 0; i < pad && i < 16; ++i) {
         int left_src_idx = pad - i;
@@ -512,7 +505,7 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
         // Branch i (1-7): conv(hidden_part + previous_output) for i >= 2, conv(hidden_part) for i == 1
         
         // Split channels: view as [seq_len, 64, 8] then split
-        struct ggml_tensor * branches[8];
+        struct ggml_tensor * branches[8] = {};
         
         // Extract each branch using view operations
         // cur is [seq_len, 512, 1], we want to split dim 1 into 8 parts of 64

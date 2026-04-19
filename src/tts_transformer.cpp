@@ -818,6 +818,14 @@ bool TTSTransformer::init_kv_cache(int32_t n_ctx) {
 
 void TTSTransformer::clear_kv_cache() {
     state_.cache.n_used = 0;
+    // zero backend memory so flash-attn cannot read stale bytes past n_used
+    // through the full-n_ctx K/V views (mask should cover it, but be defensive)
+    for (auto * t : state_.cache.k_cache) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
+    for (auto * t : state_.cache.v_cache) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
 }
 
 bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
@@ -872,6 +880,12 @@ bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
 
 void TTSTransformer::clear_code_pred_kv_cache() {
     state_.code_pred_cache.n_used = 0;
+    for (auto * t : state_.code_pred_cache.k_cache) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
+    for (auto * t : state_.code_pred_cache.v_cache) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
 }
 
 bool TTSTransformer::lookup_embedding_rows(struct ggml_tensor * embedding, const int32_t * token_ids,
@@ -1501,7 +1515,7 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
+struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t /*n_past*/) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
@@ -1904,7 +1918,7 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t n_past, int32_t generation_step) {
+struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past*/, int32_t generation_step) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;

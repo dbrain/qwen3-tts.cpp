@@ -3,6 +3,7 @@
 #include "ggml-cpu.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <numeric>
@@ -18,8 +19,6 @@ AudioTokenizerDecoder::~AudioTokenizerDecoder() {
 }
 
 void AudioTokenizerDecoder::unload_model() {
-    cached_n_frames_ = -1;
-    cached_graph_ = nullptr;
     free_audio_decoder_model(model_);
     
     if (state_.sched) {
@@ -486,8 +485,7 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_pre_tfm_layer(struct ggml_cont
 
 struct ggml_tensor * AudioTokenizerDecoder::apply_upsample_block(struct ggml_context * ctx,
                                                                    struct ggml_tensor * x,
-                                                                   const upsample_block & block,
-                                                                   int block_idx) {
+                                                                   const upsample_block & block) {
     int64_t seq_len = x->ne[0];
     int64_t channels = x->ne[1];
     
@@ -578,8 +576,7 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_residual_block(struct ggml_con
 struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_context * ctx,
                                                                   struct ggml_tensor * x,
                                                                   const decoder_block & block,
-                                                                  int upsample_rate,
-                                                                  int block_idx) {
+                                                                  int upsample_rate) {
     if (block.snake_alpha && block.snake_beta) {
         x = apply_snake(ctx, x, block.snake_alpha, block.snake_beta);
     }
@@ -747,7 +744,7 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames) {
      ggml_set_name(cur, "pre_tfm_reshaped");
     
      for (int i = 0; i < 2; ++i) {
-         cur = apply_upsample_block(ctx0, cur, model_.upsample[i], i);
+         cur = apply_upsample_block(ctx0, cur, model_.upsample[i]);
      }
      
      ggml_set_name(cur, "upsample_output");
@@ -763,7 +760,7 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames) {
      
      int upsample_rates[4] = {8, 5, 4, 3};
      for (int i = 0; i < 4; ++i) {
-         cur = apply_decoder_block(ctx0, cur, model_.dec_blocks[i], upsample_rates[i], i);
+         cur = apply_decoder_block(ctx0, cur, model_.dec_blocks[i], upsample_rates[i]);
          char name[32];
          snprintf(name, sizeof(name), "dec%d_output", i + 1);
          ggml_set_name(cur, name);
@@ -814,14 +811,11 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         }
     }
     
-    struct ggml_cgraph * gf;
-    if (n_frames == cached_n_frames_ && cached_graph_) {
-        gf = cached_graph_;
-    } else {
-        gf = build_graph(n_frames);
-        cached_n_frames_ = n_frames;
-        cached_graph_ = gf;
-    }
+    // reusing a cached graph across requests produced stale-scratch reads that
+    // corrupted audio on the second-and-later calls with the same n_frames
+    // (reproducible as saturated output on back-to-back identical requests).
+    // rebuild each call until the root cause is understood.
+    struct ggml_cgraph * gf = build_graph(n_frames);
 
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
@@ -838,11 +832,11 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
             ggml_backend_sched_reset(state_.sched);
             return false;
         }
-        
+
         for (int f = 0; f < n_frames; ++f) {
             cb_codes[f] = codes_buf_[f * cfg.n_codebooks + cb];
         }
-        
+
         ggml_backend_tensor_set(cb_tensor, cb_codes.data(), 0, n_frames * sizeof(int32_t));
     }
     
@@ -865,7 +859,7 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         ggml_backend_sched_reset(state_.sched);
         return false;
     }
-    
+
     struct ggml_tensor * audio_tensor = ggml_graph_get_tensor(gf, "audio");
     if (!audio_tensor) {
         error_msg_ = "Failed to find audio tensor";

@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
+#include <atomic>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -630,7 +631,15 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     fprintf(stderr, "  [icl] ref_frames=%d new_frames=%d total_frames=%d prepended=%d\n",
             n_ref_frames, n_frames, total_frames, (int)!codes_for_decode.empty());
     if (const char * dp = std::getenv("QWEN3_TTS_DUMP_CODES")) {
-        FILE * fp = fopen(dp, "wb");
+        static std::atomic<int> dump_counter{0};
+        int idx = dump_counter.fetch_add(1);
+        std::string path = std::string(dp);
+        if (path.find("%d") != std::string::npos) {
+            char buf[1024];
+            snprintf(buf, sizeof(buf), dp, idx);
+            path = buf;
+        }
+        FILE * fp = fopen(path.c_str(), "wb");
         if (fp) {
             int32_t hdr[3] = { n_ref_frames, n_frames, n_codebooks };
             fwrite(hdr, sizeof(int32_t), 3, fp);
@@ -639,7 +648,7 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
             }
             fwrite(speech_codes.data(), sizeof(int32_t), speech_codes.size(), fp);
             fclose(fp);
-            fprintf(stderr, "  dumped ref+new codes to %s\n", dp);
+            fprintf(stderr, "  dumped ref+new codes to %s\n", path.c_str());
         }
     }
 

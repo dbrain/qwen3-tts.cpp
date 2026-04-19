@@ -1,5 +1,13 @@
 # Build
 build/
+
+# Forensics artifacts (scratch audio / code dumps / soak logs)
+forensics/audio/
+forensics/codes/
+forensics/dumps/
+forensics/*.log
+forensics/*.stderr.log
+forensics/*.stdout.log
 *.o
 *.a
 *.so
