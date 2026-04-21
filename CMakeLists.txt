@@ -214,6 +214,15 @@ target_link_libraries(test_decoder PRIVATE
     Threads::Threads
 )
 
+# Streaming-vs-oneshot parity test for the audio decoder
+add_executable(test_streaming_parity
+    tests/test_streaming_parity.cpp
+)
+target_link_libraries(test_streaming_parity PRIVATE
+    audio_tokenizer_decoder
+    Threads::Threads
+)
+
 # ICL diagnostic dump
 add_executable(test_icl_dump
     tests/test_icl_dump.cpp

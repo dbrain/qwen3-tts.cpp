@@ -3,6 +3,7 @@
 // endpoints:
 //   GET  /health              - health check
 //   GET  /v1/models           - list loaded model
+//   GET  /v1/audio/languages  - list supported languages
 //   GET  /v1/audio/voices     - list available voices
 //   POST /v1/audio/voices     - create custom voice from reference audio
 //   DELETE /v1/audio/voices/X - delete custom voice
@@ -25,19 +26,19 @@
 using json = nlohmann::json;
 using namespace qwen3_tts;
 
-// language string to model language_id
+// supported languages and their model codec token IDs
+static const std::vector<std::pair<std::string, int>> SUPPORTED_LANGUAGES = {
+    {"en", 2050}, {"zh", 2055}, {"ja", 2058}, {"ko", 2064}, {"ru", 2069},
+    {"de", 2053}, {"fr", 2061}, {"es", 2054}, {"it", 2070}, {"pt", 2071},
+};
+
+// language string to model language_id (returns -1 if unknown)
 static int language_to_id(const std::string & lang) {
-    if (lang.empty() || lang == "en") return 2050;
-    if (lang == "ru") return 2069;
-    if (lang == "zh") return 2055;
-    if (lang == "ja") return 2058;
-    if (lang == "ko") return 2064;
-    if (lang == "de") return 2053;
-    if (lang == "fr") return 2061;
-    if (lang == "es") return 2054;
-    if (lang == "it") return 2070;
-    if (lang == "pt") return 2071;
-    return 2050;
+    if (lang.empty()) return 2050;
+    for (const auto & [code, id] : SUPPORTED_LANGUAGES) {
+        if (lang == code) return id;
+    }
+    return -1;
 }
 
 // encode float32 audio samples as a WAV byte buffer (16-bit PCM)
@@ -104,6 +105,120 @@ static std::string encode_pcm(const std::vector<float> & samples) {
         dst[i] = (int16_t)(s * 32767.0f);
     }
     return buf;
+}
+
+// emit a 44-byte WAV header with placeholder sizes for streaming.
+// clients that tolerate non-finite RIFF/data sizes (ffmpeg, vlc, most players)
+// can start playing before the full body arrives.
+static std::string wav_streaming_header(int sample_rate) {
+    const int num_channels = 1;
+    const int bits_per_sample = 16;
+    const int byte_rate = sample_rate * num_channels * bits_per_sample / 8;
+    const int block_align = num_channels * bits_per_sample / 8;
+
+    std::string buf;
+    buf.resize(44);
+    char * p = buf.data();
+
+    auto write_u32 = [](char * dst, uint32_t v) {
+        dst[0] = (char)(v & 0xff);
+        dst[1] = (char)((v >> 8) & 0xff);
+        dst[2] = (char)((v >> 16) & 0xff);
+        dst[3] = (char)((v >> 24) & 0xff);
+    };
+    auto write_u16 = [](char * dst, uint16_t v) {
+        dst[0] = (char)(v & 0xff);
+        dst[1] = (char)((v >> 8) & 0xff);
+    };
+
+    memcpy(p, "RIFF", 4);       write_u32(p + 4, 0xFFFFFFFF);
+    memcpy(p + 8, "WAVE", 4);
+    memcpy(p + 12, "fmt ", 4);  write_u32(p + 16, 16);
+    write_u16(p + 20, 1);
+    write_u16(p + 22, num_channels);
+    write_u32(p + 24, sample_rate);
+    write_u32(p + 28, byte_rate);
+    write_u16(p + 32, block_align);
+    write_u16(p + 34, bits_per_sample);
+    memcpy(p + 36, "data", 4);  write_u32(p + 40, 0xFFFFFFFF);
+    return buf;
+}
+
+// minimal RFC 4648 base64 encoder (no line wrapping)
+static std::string base64_encode(const char * data, size_t len) {
+    static const char tbl[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    int val = 0, valb = -6;
+    for (size_t i = 0; i < len; i++) {
+        val = (val << 8) + (uint8_t)data[i];
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(tbl[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6) out.push_back(tbl[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4) out.push_back('=');
+    return out;
+}
+
+// build the speech.audio.done SSE payload. usage mirrors openai (counts user
+// content tokens only); timings mirrors llama.cpp's prompt/predicted schema
+// for llama-swap compatibility. The tts-specific stages (speaker encoder,
+// vocoder, text tokenizer) are surfaced as extra keys — llama-swap ignores
+// unknown fields, and our own clients can render the full breakdown.
+//
+// Semantics:
+//   usage.input_tokens   — tokens in the user's `input` text (maps to openai billing).
+//   usage.output_tokens  — generated audio codec frames.
+//   timings.prompt_n     — real transformer prefill length (text + instruct + ref_text
+//                          + ref_codes + framing), i.e. work done before the first
+//                          generated audio token.
+//   timings.prompt_ms    — build_prefill_graph + forward_prefill wall time.
+//   timings.predicted_n  — n_audio_tokens.
+//   timings.predicted_ms — transformer autoregressive loop only (excludes vocoder and
+//                          prefill), so predicted_per_second reflects pure transformer
+//                          throughput comparable to llama-server.
+static std::string build_done_event(const tts_result & result) {
+    const int32_t input_tokens   = result.n_text_tokens;
+    const int32_t output_tokens  = result.n_audio_tokens;
+    const int32_t prefill_tokens = result.n_prefill_tokens;
+    const int64_t prompt_ms      = result.t_prefill_ms;
+
+    // transformer decode loop only. if get_last_prefill_ms() overshoots
+    // t_generate_ms by rounding, clamp to 0 rather than emit a negative.
+    int64_t predicted_ms = result.t_generate_ms - result.t_prefill_ms;
+    if (predicted_ms < 0) predicted_ms = 0;
+
+    const double pps = prompt_ms    > 0 ? (double)prefill_tokens * 1000.0 / (double)prompt_ms    : 0.0;
+    const double tps = predicted_ms > 0 ? (double)output_tokens  * 1000.0 / (double)predicted_ms : 0.0;
+
+    json ev = {
+        {"type", "speech.audio.done"},
+        {"usage", {
+            {"input_tokens",  input_tokens},
+            {"output_tokens", output_tokens},
+            {"total_tokens",  input_tokens + output_tokens},
+        }},
+        {"timings", {
+            {"prompt_n",             prefill_tokens},
+            {"predicted_n",          output_tokens},
+            {"prompt_ms",            prompt_ms},
+            {"predicted_ms",         predicted_ms},
+            {"prompt_per_second",    pps},
+            {"predicted_per_second", tps},
+            // project extras (llama-swap ignores unknown keys):
+            {"tokenize_ms",          result.t_tokenize_ms},
+            {"encode_ms",            result.t_encode_ms},
+            {"generate_ms",          result.t_generate_ms},
+            {"decode_ms",            result.t_decode_ms},
+            {"total_ms",             result.t_total_ms},
+            {"n_text_tokens",        input_tokens},
+        }},
+    };
+    return ev.dump();
 }
 
 // in-memory custom voice store
@@ -359,6 +474,15 @@ int main(int argc, char ** argv) {
         res.set_content(models.dump(), "application/json");
     });
 
+    // --- GET /v1/audio/languages ---
+    svr.Get("/v1/audio/languages", [](const httplib::Request &, httplib::Response & res) {
+        json lang_list = json::array();
+        for (const auto & [code, id] : SUPPORTED_LANGUAGES) {
+            lang_list.push_back({{"code", code}, {"id", id}});
+        }
+        res.set_content(json({{"languages", lang_list}}).dump(), "application/json");
+    });
+
     // --- GET /v1/audio/voices ---
     svr.Get("/v1/audio/voices", [&model_id, &tts, &voices, &voices_mutex](const httplib::Request &, httplib::Response & res) {
         json voice_list = json::array({"default"});
@@ -563,6 +687,7 @@ int main(int argc, char ** argv) {
         }
 
         std::string response_format = body.value("response_format", "wav");
+        std::string stream_format   = body.value("stream_format", "");
         std::string voice           = body.value("voice", "");
         std::string instructions    = body.value("instructions", "");
         std::string language        = body.value("language", "en");
@@ -570,11 +695,27 @@ int main(int argc, char ** argv) {
         int         top_k           = body.value("top_k", sp.top_k);
         float       repetition_penalty = body.value("repetition_penalty", sp.repetition_penalty);
         int64_t     seed               = body.value("seed", sp.seed);
+        int         stream_batch_size  = body.value("stream_batch_size", 0);
+        if (stream_batch_size < 0) stream_batch_size = 0;
+        if (stream_batch_size > 256) stream_batch_size = 256;
 
         fprintf(stderr, "request: voice=%s lang=%s fmt=%s temp=%.2f seed=%lld len=%zu\n",
                 voice.empty() ? "default" : voice.c_str(),
                 language.c_str(), response_format.c_str(),
                 temperature, (long long)seed, input.size());
+
+        // validate language
+        int language_id = language_to_id(language);
+        if (language_id < 0) {
+            res.status = 400;
+            json err = {{"error", {
+                {"message", "unsupported language '" + language +
+                            "', see GET /v1/audio/languages"},
+                {"type", "invalid_request_error"},
+            }}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
 
         // validate response format
         if (response_format != "wav" && response_format != "pcm") {
@@ -582,6 +723,18 @@ int main(int argc, char ** argv) {
             json err = {{"error", {
                 {"message", "unsupported response_format '" + response_format +
                             "', supported: wav, pcm"},
+                {"type", "invalid_request_error"},
+            }}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+
+        // validate stream format (empty = one-shot, openai-spec values = chunked)
+        if (!stream_format.empty() && stream_format != "audio" && stream_format != "sse") {
+            res.status = 400;
+            json err = {{"error", {
+                {"message", "unsupported stream_format '" + stream_format +
+                            "', supported: audio, sse"},
                 {"type", "invalid_request_error"},
             }}};
             res.set_content(err.dump(), "application/json");
@@ -633,11 +786,89 @@ int main(int argc, char ** argv) {
         params.top_k              = top_k;
         params.repetition_penalty = repetition_penalty;
         params.seed               = seed;
-        params.language_id        = language_to_id(language);
+        params.language_id        = language_id;
         params.print_progress     = sp.verbose;
         params.print_timing       = sp.verbose;
         params.instructions       = instructions;
         params.ref_text           = voice_ref_text;
+
+        // live streaming path: when stream_format is set and stream_batch_size
+        // > 0, synthesis runs INSIDE set_chunked_content_provider so PCM
+        // batches flush to the wire as they're produced. stream_batch_size=0
+        // preserves the legacy "synthesize-then-chunk" behavior for clients
+        // that want a single delta event.
+        const bool live_stream = !stream_format.empty() && stream_batch_size > 0;
+        if (live_stream) {
+            const bool is_sse = (stream_format == "sse");
+            const bool is_wav = (response_format == "wav");
+            const char * ctype = is_sse ? "text/event-stream"
+                                        : (is_wav ? "audio/wav" : "audio/pcm");
+
+            // capture synthesis inputs; move into provider lambda below.
+            res.set_chunked_content_provider(ctype,
+                [this_tts = &tts, input = std::move(input), params = std::move(params),
+                 voice_embedding = std::move(voice_embedding),
+                 voice_ref_codes = std::move(voice_ref_codes),
+                 voice_n_ref_frames,
+                 stream_batch_size, is_sse, is_wav,
+                 synth_mutex = &synth_mutex, sample_rate_fallback = 24000]
+                (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
+                    std::lock_guard<std::mutex> lock(*synth_mutex);
+
+                    // wav header up front (audio mode only). for SSE, the wav
+                    // bytes per-delta are raw pcm — clients reconstruct wav.
+                    bool header_written = false;
+                    auto ensure_header = [&]() {
+                        if (!header_written && !is_sse && is_wav) {
+                            std::string hdr = wav_streaming_header(sample_rate_fallback);
+                            sink.write(hdr.data(), hdr.size());
+                        }
+                        header_written = true;
+                    };
+
+                    streaming_opts sopts;
+                    sopts.batch_size = stream_batch_size;
+                    sopts.on_pcm = [&](const float * pcm, size_t n) -> bool {
+                        ensure_header();
+                        std::string bytes = encode_pcm(std::vector<float>(pcm, pcm + n));
+                        if (is_sse) {
+                            json delta = {
+                                {"type", "speech.audio.delta"},
+                                {"audio", base64_encode(bytes.data(), bytes.size())},
+                            };
+                            std::string frame = "event: speech.audio.delta\ndata: "
+                                              + delta.dump() + "\n\n";
+                            return sink.write(frame.data(), frame.size());
+                        }
+                        return sink.write(bytes.data(), bytes.size());
+                    };
+
+                    tts_result result;
+                    if (!voice_ref_codes.empty()) {
+                        result = this_tts->synthesize_with_embedding(
+                            input, voice_embedding.data(), (int32_t)voice_embedding.size(),
+                            params, voice_ref_codes.data(), voice_n_ref_frames, &sopts);
+                    } else if (!voice_embedding.empty()) {
+                        result = this_tts->synthesize_with_embedding(
+                            input, voice_embedding.data(), (int32_t)voice_embedding.size(),
+                            params, nullptr, 0, &sopts);
+                    } else {
+                        result = this_tts->synthesize(input, params, &sopts);
+                    }
+
+                    // ensure a header went out even if no pcm was produced.
+                    ensure_header();
+
+                    if (is_sse) {
+                        std::string done_frame = "event: speech.audio.done\ndata: "
+                                               + build_done_event(result) + "\n\n";
+                        sink.write(done_frame.data(), done_frame.size());
+                    }
+                    sink.done();
+                    return false;
+                });
+            return;
+        }
 
         // synthesize (serialized), using voice embedding if provided
         tts_result result;
@@ -676,13 +907,65 @@ int main(int argc, char ** argv) {
                 (float)result.audio.size() / result.sample_rate,
                 result.audio.size(), (long long)result.t_total_ms);
 
-        // encode and return audio
-        if (response_format == "pcm") {
-            std::string audio_data = encode_pcm(result.audio);
-            res.set_content(std::move(audio_data), "audio/pcm");
-        } else {
-            std::string audio_data = encode_wav(result.audio, result.sample_rate);
-            res.set_content(std::move(audio_data), "audio/wav");
+        // one-shot (no stream_format): preserve legacy behavior
+        if (stream_format.empty()) {
+            if (response_format == "pcm") {
+                res.set_content(encode_pcm(result.audio), "audio/pcm");
+            } else {
+                res.set_content(encode_wav(result.audio, result.sample_rate), "audio/wav");
+            }
+            return;
+        }
+
+        // stream_format=audio: raw chunked bytes in the chosen response_format.
+        // wav uses a placeholder-size header so playback can start immediately.
+        if (stream_format == "audio") {
+            std::string header = (response_format == "wav")
+                ? wav_streaming_header(result.sample_rate)
+                : std::string();
+            std::string body_bytes = encode_pcm(result.audio);
+            const char * ctype = (response_format == "wav") ? "audio/wav" : "audio/pcm";
+
+            res.set_chunked_content_provider(ctype,
+                [header = std::move(header), body_bytes = std::move(body_bytes)]
+                (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
+                    if (!header.empty()) {
+                        sink.write(header.data(), header.size());
+                    }
+                    sink.write(body_bytes.data(), body_bytes.size());
+                    sink.done();
+                    return false;
+                });
+            return;
+        }
+
+        // stream_format=sse: emit speech.audio.delta + speech.audio.done.
+        // response_format still selects the bytes carried inside delta (wav or
+        // pcm). usage/timings on the done event are shaped to be consumed by
+        // both openai clients and llama-swap's metrics_monitor.
+        {
+            std::string audio_bytes = (response_format == "wav")
+                ? encode_wav(result.audio, result.sample_rate)
+                : encode_pcm(result.audio);
+
+            json delta = {
+                {"type", "speech.audio.delta"},
+                {"audio", base64_encode(audio_bytes.data(), audio_bytes.size())},
+            };
+            std::string delta_frame = "event: speech.audio.delta\ndata: " + delta.dump() + "\n\n";
+            std::string done_frame  = "event: speech.audio.done\ndata: "
+                                    + build_done_event(result)
+                                    + "\n\n";
+
+            res.set_chunked_content_provider("text/event-stream",
+                [delta_frame = std::move(delta_frame), done_frame = std::move(done_frame)]
+                (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
+                    sink.write(delta_frame.data(), delta_frame.size());
+                    sink.write(done_frame.data(),  done_frame.size());
+                    sink.done();
+                    return false;
+                });
+            return;
         }
     });
 

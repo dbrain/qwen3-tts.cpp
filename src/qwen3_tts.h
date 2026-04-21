@@ -67,12 +67,19 @@ struct tts_result {
     // Error message if failed
     std::string error_msg;
     
+    // Token counts (real, not approximated)
+    int32_t n_text_tokens = 0;      // user-content text tokens (maps to openai usage.input_tokens)
+    int32_t n_prefill_tokens = 0;   // total positions the transformer prefilled
+                                    // (text + instruct + ref_text + ref_codes + framing)
+    int32_t n_audio_tokens = 0;     // codec frames produced by the transformer
+
     // Timing info (in milliseconds)
     int64_t t_load_ms = 0;
     int64_t t_tokenize_ms = 0;
-    int64_t t_encode_ms = 0;
-    int64_t t_generate_ms = 0;
-    int64_t t_decode_ms = 0;
+    int64_t t_encode_ms = 0;        // speaker encoder (voice cloning)
+    int64_t t_generate_ms = 0;      // full transformer generate() wall time
+    int64_t t_prefill_ms = 0;       // subset of t_generate_ms: build_prefill + forward_prefill
+    int64_t t_decode_ms = 0;        // vocoder decode
     int64_t t_total_ms = 0;
 
     // Process memory snapshots (bytes)
@@ -87,6 +94,18 @@ struct tts_result {
 
 // Progress callback type
 using tts_progress_callback_t = std::function<void(int tokens_generated, int max_tokens)>;
+
+// Streaming decode options. When batch_size > 0, the transformer emits
+// audio codes in frame batches that are decoded live via the audio
+// decoder's streaming path, and each decoded PCM batch is forwarded to
+// `on_pcm`. A final flush drains any trailing partial batch. The
+// aggregate PCM is also accumulated into `tts_result::audio` for parity
+// with the non-streaming path, but consumers that only care about wire
+// bytes can ignore it.
+struct streaming_opts {
+    int32_t batch_size = 0;
+    std::function<bool(const float * pcm, size_t n_samples)> on_pcm;
+};
 
 // Main TTS class that orchestrates the full pipeline
 class Qwen3TTS {
@@ -150,7 +169,13 @@ public:
                                           const float * embedding, int32_t embedding_size,
                                           const tts_params & params = tts_params(),
                                           const int32_t * ref_codes = nullptr,
-                                          int32_t n_ref_frames = 0);
+                                          int32_t n_ref_frames = 0,
+                                          const streaming_opts * stream = nullptr);
+
+    // Streaming overload for non-voice-clone synthesis. See streaming_opts.
+    tts_result synthesize(const std::string & text,
+                          const tts_params & params,
+                          const streaming_opts * stream);
 
     // Query model info
     int32_t get_hidden_size() const;
@@ -184,7 +209,8 @@ private:
                                    const tts_params & params,
                                    tts_result & result,
                                    const int32_t * ref_codes = nullptr,
-                                   int32_t n_ref_frames = 0);
+                                   int32_t n_ref_frames = 0,
+                                   const streaming_opts * stream = nullptr);
 
     bool is_aborted() const { return abort_cb_ && abort_cb_(abort_data_); }
     

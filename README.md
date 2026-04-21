@@ -14,6 +14,8 @@ This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) 
 - **ICL encoder parity fix**: correct conv-layer bias loading (a subtle `sscanf` partial-match bug silently dropped input-conv and resunit biases), raising encoder/Python cosine similarity from ~0.989 to ~0.99999 per stage and eliminating the ~350ms start-of-audio noise in cloned voices
 - **Performance optimizations**: flash attention for decode steps, static KV cache with `ggml_set_rows`, cached vocoder decoder graph
 - **OpenAI-compatible HTTP server** (`qwen3-tts-server`) with `/v1/audio/speech` and `/v1/audio/voices` endpoints, voice cloning via multipart upload, and `--hf-repo` for auto-downloading GGUFs from the [Qwen3-TTS collection](https://huggingface.co/collections/khimaros/qwen3-tts)
+- **Streaming audio output**: chunked vocoder decode with causal tails, per-layer KV rolling, and conv-transpose overlap state, so PCM is emitted frame-by-frame while the transformer is still generating. Exposed via the CLI `--streaming-batch-size N` flag and wired through the server for live HTTP responses; parity-tested against one-shot decode
+- **Real token accounting** in `tts_result` (text / prefill / audio tokens, plus prefill time broken out of total generate time) for accurate OpenAI `usage` reporting
 - **Multi-variant model support** (Base / CustomVoice / VoiceDesign) with speaker presets and language IDs stored in GGUF metadata
 - **Batch model conversion** script that downloads and converts all Qwen3-TTS variants in one shot
 

@@ -10,6 +10,7 @@
 #include <vector>
 #include <memory>
 #include <random>
+#include <functional>
 #ifdef QWEN3_TTS_TIMING
 #include <chrono>
 #endif
@@ -303,6 +304,14 @@ public:
     // Set abort callback checked before each graph compute (thread-safe)
     void set_abort_callback(ggml_abort_callback callback, void * data);
 
+    // Fired inside generate() after each frame's 16 codebook codes are
+    // pushed onto the output vector. The callback receives the frame
+    // index and a pointer to the new frame's codes (valid only for the
+    // duration of the call). Returning false aborts generation.
+    using frame_emit_fn = std::function<bool(int32_t frame_idx,
+                                             const int32_t * frame_codes)>;
+    void set_frame_callback(frame_emit_fn cb) { frame_cb_ = std::move(cb); }
+
     // Enable per-stage progress prints inside generate() (prefill + decode loop)
     void set_verbose(bool v) { verbose_ = v; }
 
@@ -311,6 +320,14 @@ public:
 
     // Check if abort has been requested
     bool is_aborted() const;
+
+    // Stats from the most recent generate() call. Prefill = build_prefill_graph
+    // + forward_prefill (everything before the autoregressive loop). Decode
+    // timing is the loop itself; wall-clock of generate() = prefill + decode
+    // (plus negligible overhead).
+    int32_t get_last_n_prefill_tokens() const { return last_n_prefill_tokens_; }
+    int64_t get_last_prefill_ms()       const { return last_prefill_ms_; }
+    int64_t get_last_decode_ms()        const { return last_decode_ms_; }
     
     // Legacy interface for compatibility
     bool forward(const int32_t * tokens, int32_t n_tokens, int32_t n_past,
@@ -380,7 +397,13 @@ private:
     ggml_abort_callback abort_cb_ = nullptr;
     void * abort_data_ = nullptr;
     bool verbose_ = false;
-    
+    frame_emit_fn frame_cb_;
+
+    // Stats populated by generate()
+    int32_t last_n_prefill_tokens_ = 0;
+    int64_t last_prefill_ms_ = 0;
+    int64_t last_decode_ms_ = 0;
+
     // Cached hidden states from last forward pass
     std::vector<float> last_hidden_;
     std::vector<ggml_fp16_t> embd_row_fp16_scratch_;

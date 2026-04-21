@@ -36,7 +36,8 @@ int main(int argc, char ** argv) {
     std::string text;
     std::string output_file = "output.wav";
     std::string reference_audio;
-    
+    int32_t streaming_batch_size = 0;
+
     qwen3_tts::tts_params params;
     
     // Parse arguments
@@ -141,6 +142,9 @@ int main(int argc, char ** argv) {
                 return 1;
             }
             params.instructions = argv[i];
+        } else if (arg == "--streaming-batch-size") {
+            if (++i >= argc) { fprintf(stderr, "Error: missing streaming-batch-size value\n"); return 1; }
+            streaming_batch_size = std::stoi(argv[i]);
         } else if (arg == "-j" || arg == "--threads") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing threads value\n");
@@ -196,9 +200,24 @@ int main(int argc, char ** argv) {
     // Generate speech
     qwen3_tts::tts_result result;
     
+    qwen3_tts::streaming_opts stream_opts;
+    size_t stream_batches_seen = 0;
+    if (streaming_batch_size > 0) {
+        stream_opts.batch_size = streaming_batch_size;
+        stream_opts.on_pcm = [&stream_batches_seen](const float * /*pcm*/, size_t n) {
+            stream_batches_seen++;
+            fprintf(stderr, "\r[stream] batch %zu: %zu samples", stream_batches_seen, n);
+            return true;
+        };
+    }
+
     if (reference_audio.empty()) {
         fprintf(stderr, "Synthesizing: \"%s\"\n", text.c_str());
-        result = tts.synthesize(text, params);
+        if (streaming_batch_size > 0) {
+            result = tts.synthesize(text, params, &stream_opts);
+        } else {
+            result = tts.synthesize(text, params);
+        }
     } else {
         fprintf(stderr, "Synthesizing with voice cloning: \"%s\"\n", text.c_str());
         fprintf(stderr, "Reference audio: %s\n", reference_audio.c_str());

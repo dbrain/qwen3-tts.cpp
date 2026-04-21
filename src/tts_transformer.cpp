@@ -2880,6 +2880,12 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
     };
+    // always-on stats: zero then capture start of generate (= start of prefill).
+    last_n_prefill_tokens_ = 0;
+    last_prefill_ms_ = 0;
+    last_decode_ms_ = 0;
+    const int64_t t_gen_start_ms = verbose_now_ms();
+    int64_t t_prefill_end_ms = t_gen_start_ms;
     int64_t t_prefill_build_start = verbose_ ? verbose_now_ms() : 0;
     if (!build_prefill_graph(text_tokens, n_tokens, speaker_embd, language_id,
                              prefill_embd, trailing_text_hidden, tts_pad_embed,
@@ -2930,6 +2936,11 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     t1 = clk::now();
     timing.t_prefill_forward_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
+    // prefill is complete: build_prefill_graph + forward_prefill. decode loop
+    // begins next.
+    t_prefill_end_ms = verbose_now_ms();
+    last_n_prefill_tokens_ = prefill_len;
+    last_prefill_ms_ = t_prefill_end_ms - t_gen_start_ms;
     
     output.clear();
     output.reserve(max_len * cfg.n_codebooks);
@@ -3058,6 +3069,13 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             output.push_back(frame_codes[cb]);
         }
 
+        if (frame_cb_) {
+            const int32_t * frame_ptr = output.data() + output.size() - cfg.n_codebooks;
+            if (!frame_cb_(frame, frame_ptr)) {
+                return false;
+            }
+        }
+
 #ifdef QWEN3_TTS_TIMING
         timing.n_frames = frame + 1;
 #endif
@@ -3112,7 +3130,9 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         
         n_past++;
     }
-    
+
+    last_decode_ms_ = verbose_now_ms() - t_prefill_end_ms;
+
 #ifdef QWEN3_TTS_TIMING
     timing.t_generate_total_ms = std::chrono::duration<double, std::milli>(clk::now() - t_gen_start).count();
     timing_ = nullptr;

@@ -234,18 +234,25 @@ bool Qwen3TTS::load_model_files(const std::string & tts_path,
 
 tts_result Qwen3TTS::synthesize(const std::string & text,
                                  const tts_params & params) {
+    return synthesize(text, params, nullptr);
+}
+
+tts_result Qwen3TTS::synthesize(const std::string & text,
+                                 const tts_params & params,
+                                 const streaming_opts * stream) {
     tts_result result;
-    
+
     if (!models_loaded_) {
         result.error_msg = "Models not loaded";
         return result;
     }
-    
+
     // For basic synthesis without voice cloning, we use a zero speaker embedding
     // This will use the model's default voice characteristics
     std::vector<float> zero_embedding(transformer_.get_config().hidden_size, 0.0f);
 
-    return synthesize_internal(text, zero_embedding.data(), params, result);
+    return synthesize_internal(text, zero_embedding.data(), params, result,
+                               nullptr, 0, stream);
 }
 
 tts_result Qwen3TTS::synthesize_with_voice(const std::string & text,
@@ -426,7 +433,8 @@ tts_result Qwen3TTS::synthesize_with_embedding(const std::string & text,
                                                  const float * embedding, int32_t embedding_size,
                                                  const tts_params & params,
                                                  const int32_t * ref_codes,
-                                                 int32_t n_ref_frames) {
+                                                 int32_t n_ref_frames,
+                                                 const streaming_opts * stream) {
     tts_result result;
 
     if (!models_loaded_) {
@@ -446,7 +454,7 @@ tts_result Qwen3TTS::synthesize_with_embedding(const std::string & text,
         return result;
     }
 
-    return synthesize_internal(text, embedding, params, result, ref_codes, n_ref_frames);
+    return synthesize_internal(text, embedding, params, result, ref_codes, n_ref_frames, stream);
 }
 
 tts_result Qwen3TTS::synthesize_internal(const std::string & text,
@@ -454,7 +462,8 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                                           const tts_params & params,
                                           tts_result & result,
                                           const int32_t * ref_codes,
-                                          int32_t n_ref_frames) {
+                                          int32_t n_ref_frames,
+                                          const streaming_opts * stream) {
     int64_t t_total_start = get_time_ms();
     auto sample_memory = [&](const char * stage) {
         process_memory_snapshot mem;
@@ -490,8 +499,9 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         instruct_tokens = tokenizer_.encode_instruct(params.instructions);
     }
     result.t_tokenize_ms = get_time_ms() - t_tokenize_start;
+    result.n_text_tokens = (int32_t)text_tokens.size();
     sample_memory("synth/after-tokenize");
-    
+
     if (text_tokens.empty()) {
         result.error_msg = "Failed to tokenize text";
         return result;
@@ -550,6 +560,71 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
     }
 
+    // streaming: install per-frame callback that batches codes and live-decodes
+    // via the vocoder's streaming path. we must also ensure the decoder is
+    // loaded before generate() so its stream_decode can be called from within
+    // the callback. ICL warm-up (ref_codes) is fed as a discarded chunk below.
+    const bool streaming = stream && stream->batch_size > 0 && stream->on_pcm;
+    std::vector<int32_t> stream_buf;
+    size_t stream_cb_count = 0;
+    bool stream_cb_aborted = false;
+    if (streaming) {
+        if (!decoder_loaded_) {
+            int64_t t_decoder_load_start = get_time_ms();
+            if (decoder_model_path_.empty()) {
+                result.error_msg = "Internal error: missing vocoder model path";
+                return result;
+            }
+            if (!audio_decoder_.load_model(decoder_model_path_)) {
+                result.error_msg = "Failed to load vocoder: " + audio_decoder_.get_error();
+                return result;
+            }
+            audio_decoder_.set_abort_callback(abort_cb_, abort_data_);
+            decoder_loaded_ = true;
+            if (params.print_timing) {
+                fprintf(stderr, "  Vocoder lazy-loaded in %lld ms\n",
+                        (long long)(get_time_ms() - t_decoder_load_start));
+                sample_memory("synth/after-vocoder-load-stream");
+            }
+        }
+        audio_decoder_.stream_reset();
+        const int n_cb = transformer_.get_config().n_codebooks;
+
+        // ICL warm-up: feed ref_codes through the streaming decoder and
+        // discard its PCM. mirrors the non-streaming prepend+trim path.
+        if (ref_codes && n_ref_frames > 0 && !params.ref_text.empty()) {
+            std::vector<float> warmup_pcm;
+            if (!audio_decoder_.stream_decode(ref_codes, n_ref_frames, warmup_pcm)) {
+                result.error_msg = "Failed to warm-up vocoder with ref codes: " + audio_decoder_.get_error();
+                return result;
+            }
+            // discard warmup_pcm — downstream only sees post-ref PCM
+        }
+
+        stream_buf.reserve((size_t) stream->batch_size * n_cb);
+        transformer_.set_frame_callback(
+            [this, stream, &stream_buf, &stream_cb_count, &stream_cb_aborted, n_cb, &result]
+            (int32_t /*frame_idx*/, const int32_t * frame_codes) -> bool {
+                for (int c = 0; c < n_cb; ++c) stream_buf.push_back(frame_codes[c]);
+                const int frames_buffered = (int) (stream_buf.size() / n_cb);
+                if (frames_buffered >= stream->batch_size) {
+                    std::vector<float> pcm;
+                    if (!audio_decoder_.stream_decode(stream_buf.data(), frames_buffered, pcm)) {
+                        stream_cb_aborted = true;
+                        return false;
+                    }
+                    stream_buf.clear();
+                    result.audio.insert(result.audio.end(), pcm.begin(), pcm.end());
+                    stream_cb_count++;
+                    if (!stream->on_pcm(pcm.data(), pcm.size())) {
+                        stream_cb_aborted = true;
+                        return false;
+                    }
+                }
+                return true;
+            });
+    }
+
     std::vector<int32_t> speech_codes;
     if (!transformer_.generate(text_tokens.data(), (int32_t)text_tokens.size(),
                                speaker_embedding, params.max_audio_tokens, speech_codes,
@@ -560,10 +635,16 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                                ref_text_tokens.empty() ? nullptr : ref_text_tokens.data(),
                                (int32_t)ref_text_tokens.size(),
                                ref_codes, n_ref_frames)) {
+        if (streaming) transformer_.set_frame_callback({});
         result.error_msg = "Failed to generate speech codes: " + transformer_.get_error();
         return result;
     }
+    if (streaming) {
+        transformer_.set_frame_callback({});
+    }
     result.t_generate_ms = get_time_ms() - t_generate_start;
+    result.n_prefill_tokens = transformer_.get_last_n_prefill_tokens();
+    result.t_prefill_ms     = transformer_.get_last_prefill_ms();
     sample_memory("synth/after-generate");
 
     if (is_aborted()) {
@@ -573,7 +654,8 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
 
     int n_codebooks = transformer_.get_config().n_codebooks;
     int n_frames = (int)speech_codes.size() / n_codebooks;
-    
+    result.n_audio_tokens = n_frames;
+
     if (params.print_progress) {
         fprintf(stderr, "Speech codes generated: %d frames x %d codebooks\n", n_frames, n_codebooks);
     }
@@ -591,6 +673,41 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     
     // Step 4: Decode speech codes to waveform using vocoder
     int64_t t_decode_start = get_time_ms();
+
+    // streaming path: frames were already decoded live in the frame callback.
+    // flush any residual (< batch_size) frames now, then skip the one-shot
+    // decode that follows.
+    if (streaming) {
+        const int n_cb = transformer_.get_config().n_codebooks;
+        const int leftover = (int) (stream_buf.size() / n_cb);
+        if (leftover > 0 && !stream_cb_aborted) {
+            std::vector<float> pcm;
+            if (!audio_decoder_.stream_decode(stream_buf.data(), leftover, pcm)) {
+                result.error_msg = "Failed to flush streaming vocoder: " + audio_decoder_.get_error();
+                return result;
+            }
+            stream_buf.clear();
+            result.audio.insert(result.audio.end(), pcm.begin(), pcm.end());
+            if (!stream->on_pcm(pcm.data(), pcm.size())) {
+                stream_cb_aborted = true;
+            }
+        }
+        result.t_decode_ms = get_time_ms() - t_decode_start;
+        sample_memory("synth/after-stream-decode");
+        if (params.print_progress) {
+            fprintf(stderr, "Streaming: %zu batches dispatched, %zu total samples\n",
+                    stream_cb_count, result.audio.size());
+        }
+        result.sample_rate = audio_decoder_.get_config().sample_rate;
+        result.success = !stream_cb_aborted;
+        if (stream_cb_aborted && result.error_msg.empty()) {
+            result.error_msg = "Streaming consumer aborted";
+        }
+        result.t_total_ms = get_time_ms() - t_total_start;
+        sample_memory("synth/end");
+        return result;
+    }
+
     if (!decoder_loaded_) {
         int64_t t_decoder_load_start = get_time_ms();
         if (decoder_model_path_.empty()) {
