@@ -386,23 +386,14 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_snake(struct ggml_context * ct
                                                          struct ggml_tensor * x,
                                                          struct ggml_tensor * alpha,
                                                          struct ggml_tensor * beta) {
-    // ggml_mul broadcasts when src1 is repeat-compatible with src0, so we
-    // skip the explicit ggml_repeat into a freshly-allocated [seq_len,
-    // channels, batch] temp tensor — that was a wholly unnecessary
-    // materialisation that doubled per-snake memory bandwidth on the deepest
-    // (highest-channel-count) decoder blocks. Reshape α/β to [1, channels, 1]
-    // and let ggml broadcast them at op time.
-    int64_t channels = x->ne[1];
-
-    struct ggml_tensor * alpha_3d = ggml_reshape_3d(ctx, ggml_exp(ctx, alpha), 1, channels, 1);
-    struct ggml_tensor * inv_beta_3d = ggml_reshape_3d(
-        ctx, ggml_exp(ctx, ggml_scale(ctx, beta, -1.0f)), 1, channels, 1);
-
-    struct ggml_tensor * ax        = ggml_mul(ctx, x, alpha_3d);
-    struct ggml_tensor * sin_sq    = ggml_sqr(ctx, ggml_sin(ctx, ax));
-    struct ggml_tensor * scaled_sin = ggml_mul(ctx, sin_sq, inv_beta_3d);
-
-    return ggml_add(ctx, x, scaled_sin);
+    // Fused GGML_OP_SNAKE: y = x + sin²(exp(α)·x) / exp(β), one CUDA kernel
+    // pass. Replaces a 6-op chain (exp → reshape → mul → sin → sqr → mul → add)
+    // that was bandwidth-bound on the deepest (~552k samples × 96 channels)
+    // decoder block. Op definition: ../ggml/src/ggml-cuda/snake.cu (ported
+    // from Danmoreng/ggml@feat/op-snake). α and β are 1-D per-channel
+    // vectors; the fused op handles the exp and per-channel broadcast inside
+    // the kernel.
+    return ggml_snake(ctx, x, alpha, beta);
 }
 
 struct ggml_tensor * AudioTokenizerDecoder::apply_rms_norm(struct ggml_context * ctx,
