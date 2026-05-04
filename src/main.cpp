@@ -11,6 +11,7 @@ void print_usage(const char * program) {
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -m, --model <path>     Talker gguf file, or directory containing talker+tokenizer ggufs (required)\n");
     fprintf(stderr, "      --vocoder <file>   Tokenizer/vocoder gguf (required when -m is a file; else auto-discovered)\n");
+    fprintf(stderr, "      --speaker-encoder <file> Optional GGUF to load spk_enc.* tensors from (e.g. Base GGUF when -m is VoiceDesign)\n");
     fprintf(stderr, "  -t, --text <text>      Text to synthesize (required)\n");
     fprintf(stderr, "  -o, --output <file>    Output WAV file (default: output.wav)\n");
     fprintf(stderr, "  -r, --reference <file> Reference audio for voice cloning\n");
@@ -33,6 +34,7 @@ void print_usage(const char * program) {
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string vocoder_path;
+    std::string speaker_encoder_path;
     std::string text;
     std::string output_file = "output.wav";
     std::string reference_audio;
@@ -56,6 +58,9 @@ int main(int argc, char ** argv) {
         } else if (arg == "--vocoder") {
             if (++i >= argc) { fprintf(stderr, "Error: missing vocoder path\n"); return 1; }
             vocoder_path = argv[i];
+        } else if (arg == "--speaker-encoder") {
+            if (++i >= argc) { fprintf(stderr, "Error: missing speaker-encoder path\n"); return 1; }
+            speaker_encoder_path = argv[i];
         } else if (arg == "-t" || arg == "--text") {
             if (++i >= argc) {
                 fprintf(stderr, "Error: missing text\n");
@@ -182,7 +187,7 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "Loading talker: %s\n", model_path.c_str());
         fprintf(stderr, "Loading vocoder: %s\n", vocoder_path.c_str());
-        loaded = tts.load_model_files(model_path, vocoder_path);
+        loaded = tts.load_model_files(model_path, vocoder_path, speaker_encoder_path);
     } else {
         fprintf(stderr, "Loading models from: %s\n", model_path.c_str());
         loaded = tts.load_models(model_path);

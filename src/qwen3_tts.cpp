@@ -140,7 +140,8 @@ bool Qwen3TTS::load_models(const std::string & model_dir) {
 }
 
 bool Qwen3TTS::load_model_files(const std::string & tts_path,
-                                 const std::string & vocoder_path) {
+                                 const std::string & vocoder_path,
+                                 const std::string & speaker_encoder_path) {
     int64_t t_start = get_time_ms();
     log_memory_usage("load/start");
 
@@ -151,6 +152,7 @@ bool Qwen3TTS::load_model_files(const std::string & tts_path,
     decoder_loaded_ = false;
 
     tts_model_path_ = tts_path;
+    speaker_encoder_model_path_ = speaker_encoder_path;
 
     // derive vocoder path from same directory if not specified
     if (vocoder_path.empty()) {
@@ -159,6 +161,11 @@ bool Qwen3TTS::load_model_files(const std::string & tts_path,
         decoder_model_path_ = dir + "/qwen3-tts-tokenizer-f16.gguf";
     } else {
         decoder_model_path_ = vocoder_path;
+    }
+
+    if (!speaker_encoder_model_path_.empty()) {
+        fprintf(stderr, "  Speaker encoder source: %s (separate GGUF)\n",
+                speaker_encoder_model_path_.c_str());
     }
 
     const char * low_mem_env = std::getenv("QWEN3_TTS_LOW_MEM");
@@ -289,12 +296,15 @@ tts_result Qwen3TTS::synthesize_with_voice(const std::string & text,
     }
 
     if (!encoder_loaded_) {
-        if (tts_model_path_.empty()) {
+        const std::string & enc_path = !speaker_encoder_model_path_.empty()
+            ? speaker_encoder_model_path_
+            : tts_model_path_;
+        if (enc_path.empty()) {
             result.error_msg = "Internal error: missing TTS model path for lazy encoder load";
             return result;
         }
         int64_t t_encoder_load_start = get_time_ms();
-        if (!audio_encoder_.load_model(tts_model_path_)) {
+        if (!audio_encoder_.load_model(enc_path)) {
             result.error_msg = "Failed to load speaker encoder: " + audio_encoder_.get_error();
             return result;
         }
@@ -382,11 +392,14 @@ bool Qwen3TTS::extract_speaker_embedding(const std::string & reference_audio,
     }
 
     if (!encoder_loaded_) {
-        if (tts_model_path_.empty()) {
+        const std::string & enc_path = !speaker_encoder_model_path_.empty()
+            ? speaker_encoder_model_path_
+            : tts_model_path_;
+        if (enc_path.empty()) {
             error_msg_ = "Internal error: missing TTS model path for lazy encoder load";
             return false;
         }
-        if (!audio_encoder_.load_model(tts_model_path_)) {
+        if (!audio_encoder_.load_model(enc_path)) {
             error_msg_ = "Failed to load speaker encoder: " + audio_encoder_.get_error();
             return false;
         }
@@ -727,22 +740,23 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
     }
     
-    // ICL: prepend ref_codes to the talker output so the vocoder has warm
-    // context (matches qwen3_tts_model.py:616, torch.cat([ref, new])). We then
-    // slice the ref portion off the decoded wav below. Without this, the
-    // vocoder cold-starts and produces ~350ms of noise at the beginning.
-    std::vector<int32_t> codes_for_decode;
+    // ICL: previously we'd prepend ref_codes to the talker output so the
+    // vocoder gets warm context (match qwen3_tts_model.py:616), then trim the
+    // ref portion off the decoded wav. Two problems with that:
+    //   (1) proportional trim was off because the decoder doesn't produce
+    //       constant samples-per-frame, especially at silence boundaries — left
+    //       multiple seconds of ref bleeding into the start of cloned output.
+    //   (2) decoding ref alone (to measure exact length for trim) gives a
+    //       different boundary state than decoding [ref + new] together, so
+    //       even an "exact" trim by ref-alone-decode-length still leaks audible
+    //       ref content from the join point.
+    //
+    // Cleanest fix: don't prepend ref at decode. Decode just the talker's new
+    // codes directly. PyTorch hybrid testing (phase 6d C-noconcat) showed no
+    // audible cold-start click in practice, so the warm-up motivation doesn't
+    // hold up empirically on this codec.
+    std::vector<int32_t> codes_for_decode;  // unused now; kept as marker for skipped trim path
     int32_t total_frames = n_frames;
-    if (ref_codes && n_ref_frames > 0 && !params.ref_text.empty()) {
-        total_frames = n_ref_frames + n_frames;
-        codes_for_decode.resize((size_t)total_frames * n_codebooks);
-        std::memcpy(codes_for_decode.data(),
-                    ref_codes,
-                    (size_t)n_ref_frames * n_codebooks * sizeof(int32_t));
-        std::memcpy(codes_for_decode.data() + (size_t)n_ref_frames * n_codebooks,
-                    speech_codes.data(),
-                    speech_codes.size() * sizeof(int32_t));
-    }
     const int32_t * decode_codes =
         codes_for_decode.empty() ? speech_codes.data() : codes_for_decode.data();
     fprintf(stderr, "  [icl] ref_frames=%d new_frames=%d total_frames=%d prepended=%d\n",
@@ -774,16 +788,7 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         return result;
     }
 
-    // trim the ref-code portion from the decoded wav (qwen3_tts_model.py:628).
-    if (!codes_for_decode.empty() && !result.audio.empty()) {
-        size_t total_samples = result.audio.size();
-        size_t cut = (size_t)(((int64_t)n_ref_frames * (int64_t)total_samples)
-                               / (int64_t)total_frames);
-        if (cut < total_samples) {
-            result.audio.erase(result.audio.begin(),
-                               result.audio.begin() + (ptrdiff_t)cut);
-        }
-    }
+    // (no trim needed — we decode just the generated codes, no ref prepended)
     result.t_decode_ms = get_time_ms() - t_decode_start;
     sample_memory("synth/after-decode");
 
@@ -845,7 +850,10 @@ const std::vector<int32_t> & Qwen3TTS::get_speaker_ids() const {
 }
 
 bool Qwen3TTS::has_speaker_encoder() const {
-    return transformer_.get_config().has_speaker_encoder;
+    // Either: (a) the main TTS GGUF advertises speaker_encoder via metadata,
+    // or (b) an external speaker_encoder GGUF was supplied via load_model_files.
+    return transformer_.get_config().has_speaker_encoder
+           || !speaker_encoder_model_path_.empty();
 }
 
 int32_t Qwen3TTS::get_speaker_id(const std::string & name) const {

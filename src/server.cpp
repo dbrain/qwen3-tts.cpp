@@ -234,6 +234,7 @@ struct custom_voice {
 struct server_params {
     std::string model;
     std::string vocoder;
+    std::string speaker_encoder;   // optional separate GGUF for spk_enc.* tensors
     std::string hf_repo;     // e.g. "khimaros/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF:Q8_0"
     std::string hf_file;     // override filename within --hf-repo
     std::string hf_repo_v;   // vocoder HF repo
@@ -318,6 +319,7 @@ static void print_usage(const char * program) {
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -m,  --model <file>             TTS model GGUF file\n");
     fprintf(stderr, "  -v,  --vocoder <file>           vocoder GGUF file (default: same dir as model)\n");
+    fprintf(stderr, "       --speaker-encoder <file>    optional GGUF to load spk_enc.* tensors from (e.g. Base GGUF when -m is VoiceDesign)\n");
     fprintf(stderr, "  -hf, --hf-repo <repo[:quant]>   HuggingFace model repo (default quant: Q8_0)\n");
     fprintf(stderr, "       --hf-file <file>            override GGUF filename within --hf-repo\n");
     fprintf(stderr, "       --hf-repo-v <repo[:quant]>  HuggingFace vocoder repo\n");
@@ -345,6 +347,9 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "-v" || arg == "--vocoder") {
             if (++i >= argc) { fprintf(stderr, "error: missing vocoder path\n"); return false; }
             sp.vocoder = argv[i];
+        } else if (arg == "--speaker-encoder") {
+            if (++i >= argc) { fprintf(stderr, "error: missing speaker-encoder path\n"); return false; }
+            sp.speaker_encoder = argv[i];
         } else if (arg == "-H" || arg == "--host") {
             if (++i >= argc) { fprintf(stderr, "error: missing host\n"); return false; }
             sp.host = argv[i];
@@ -417,7 +422,7 @@ int main(int argc, char ** argv) {
     if (!sp.vocoder.empty()) {
         fprintf(stderr, "loading vocoder: %s\n", sp.vocoder.c_str());
     }
-    if (!tts.load_model_files(sp.model, sp.vocoder)) {
+    if (!tts.load_model_files(sp.model, sp.vocoder, sp.speaker_encoder)) {
         fprintf(stderr, "fatal: %s\n", tts.get_error().c_str());
         return 1;
     }
@@ -693,9 +698,13 @@ int main(int argc, char ** argv) {
         std::string language        = body.value("language", "en");
         float       temperature     = body.value("temperature", sp.temperature);
         int         top_k           = body.value("top_k", sp.top_k);
+        float       top_p           = body.value("top_p", 1.0f);
+        int         max_audio_tokens = body.value("max_audio_tokens", 2048);
         float       repetition_penalty = body.value("repetition_penalty", sp.repetition_penalty);
         int64_t     seed               = body.value("seed", sp.seed);
         int         stream_batch_size  = body.value("stream_batch_size", 0);
+        if (max_audio_tokens < 1) max_audio_tokens = 1;
+        if (max_audio_tokens > 8192) max_audio_tokens = 8192;
         if (stream_batch_size < 0) stream_batch_size = 0;
         if (stream_batch_size > 256) stream_batch_size = 256;
 
@@ -784,6 +793,8 @@ int main(int argc, char ** argv) {
         params.n_threads          = sp.n_threads;
         params.temperature        = temperature;
         params.top_k              = top_k;
+        params.top_p              = top_p;
+        params.max_audio_tokens   = max_audio_tokens;
         params.repetition_penalty = repetition_penalty;
         params.seed               = seed;
         params.language_id        = language_id;

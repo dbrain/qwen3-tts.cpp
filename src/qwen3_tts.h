@@ -120,8 +120,14 @@ public:
     // Load models from explicit file paths
     // tts_model_path: path to the TTS GGUF (tokenizer + transformer + encoder)
     // vocoder_model_path: path to the vocoder GGUF (if empty, looks in same directory)
+    // speaker_encoder_model_path: optional separate GGUF that contains spk_enc.* tensors
+    //   and qwen3-tts.speaker_encoder.* metadata. When set, the speaker encoder is loaded
+    //   from this path instead of from tts_model_path. Use case: VoiceDesign GGUF (no
+    //   spk_enc) + Base GGUF (has spk_enc) — gives one resident model with both
+    //   description-driven voices AND audio-reference cloning.
     bool load_model_files(const std::string & tts_model_path,
-                          const std::string & vocoder_model_path = "");
+                          const std::string & vocoder_model_path = "",
+                          const std::string & speaker_encoder_model_path = "");
     
     // Generate speech from text
     // text: input text to synthesize
@@ -229,6 +235,7 @@ private:
     std::string error_msg_;
     std::string tts_model_path_;
     std::string decoder_model_path_;
+    std::string speaker_encoder_model_path_;
     tts_progress_callback_t progress_callback_;
     ggml_abort_callback abort_cb_ = nullptr;
     void * abort_data_ = nullptr;
