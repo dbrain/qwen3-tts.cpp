@@ -797,15 +797,20 @@ bool TTSTransformer::init_kv_cache(int32_t n_ctx) {
     
     state_.cache.k_cache.resize(cfg.n_layers);
     state_.cache.v_cache.resize(cfg.n_layers);
-    
+
+    // QWEN3_TTS_KV_Q8=1 → Q8_0 K/V (auto-pairs with FA prefill in
+    // build_prefill_forward_graph). head_dim=128 is multiple of QK8_0=32.
+    const ggml_type kv_type =
+        (std::getenv("QWEN3_TTS_KV_Q8") != nullptr) ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+
     for (int il = 0; il < cfg.n_layers; ++il) {
         state_.cache.k_cache[il] = ggml_new_tensor_3d(
-            state_.cache.ctx, GGML_TYPE_F16,
+            state_.cache.ctx, kv_type,
             cfg.head_dim, cfg.n_key_value_heads, n_ctx);
         ggml_format_name(state_.cache.k_cache[il], "k_cache_%d", il);
-        
+
         state_.cache.v_cache[il] = ggml_new_tensor_3d(
-            state_.cache.ctx, GGML_TYPE_F16,
+            state_.cache.ctx, kv_type,
             cfg.head_dim, cfg.n_key_value_heads, n_ctx);
         ggml_format_name(state_.cache.v_cache[il], "v_cache_%d", il);
     }
@@ -833,11 +838,14 @@ void TTSTransformer::clear_kv_cache() {
 
 // --- Talker prefill KV cache (item D in HANDOFF-perf-5) -------------------
 
-// Bytes per cached position per layer per K-or-V tensor.
-// Cache layout = [head_dim, n_kv_heads, n_pos] of F16, so per-position
-// stride = head_dim * n_kv_heads * sizeof(ggml_fp16_t).
+// Bytes per cached position per layer per K-or-V tensor. Quant-aware:
+// works for F16 (sizeof) and Q8_0 (block-packed) without a special case.
 static inline size_t kv_pos_stride(const tts_kv_cache & cache) {
-    return (size_t) cache.head_dim * cache.n_kv_heads * sizeof(uint16_t);
+    if (cache.k_cache.empty() || !cache.k_cache[0]) {
+        return (size_t) cache.head_dim * cache.n_kv_heads * sizeof(uint16_t);
+    }
+    const ggml_type t = cache.k_cache[0]->type;
+    return (size_t) ggml_row_size(t, cache.head_dim) * cache.n_kv_heads;
 }
 
 bool TTSTransformer::capture_kv_state(int32_t n_pos, prefill_kv_snapshot & out) {
@@ -1606,12 +1614,24 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
     ggml_set_name(inp_pos, "inp_pos");
     ggml_set_input(inp_pos);
 
+    // FA on quant KV — manual path's ggml_transpose(V) has no quantized impl.
+    const bool use_fa = !state_.cache.k_cache.empty()
+        && state_.cache.k_cache[0]
+        && ggml_is_quantized(state_.cache.k_cache[0]->type);
+
+    struct ggml_tensor * inp_mask = nullptr;
+    if (use_fa) {
+        inp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, state_.cache.n_ctx, n_tokens);
+        ggml_set_name(inp_mask, "inp_mask");
+        ggml_set_input(inp_mask);
+    }
+
     struct ggml_tensor * cur = inp_prefill_embd;
 
     struct ggml_tensor * inpL = cur;
-    
+
     const float KQscale = 1.0f / sqrtf(float(head_dim));
-    
+
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model_.layers[il];
         
@@ -1665,17 +1685,22 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
         K = ggml_permute(ctx0, K, 0, 2, 1, 3);
         V = ggml_permute(ctx0, V, 0, 2, 1, 3);
-        
-        struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
-        KQ = ggml_scale(ctx0, KQ, KQscale);
-        KQ = ggml_diag_mask_inf(ctx0, KQ, n_past);
-        KQ = ggml_soft_max(ctx0, KQ);
 
-        V = ggml_cont(ctx0, ggml_transpose(ctx0, V));
+        if (use_fa) {
+            cur = ggml_flash_attn_ext(ctx0, Q, K, V, inp_mask, KQscale, 0.0f, 0.0f);
+            cur = ggml_cont_2d(ctx0, cur, n_head * head_dim, n_tokens);
+        } else {
+            struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+            KQ = ggml_scale(ctx0, KQ, KQscale);
+            KQ = ggml_diag_mask_inf(ctx0, KQ, n_past);
+            KQ = ggml_soft_max(ctx0, KQ);
 
-        struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
-        KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-        cur = ggml_cont_2d(ctx0, KQV, n_head * head_dim, n_tokens);
+            V = ggml_cont(ctx0, ggml_transpose(ctx0, V));
+
+            struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
+            KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+            cur = ggml_cont_2d(ctx0, KQV, n_head * head_dim, n_tokens);
+        }
         
         cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
         cur = ggml_add(ctx0, cur, inpL);
@@ -2335,6 +2360,23 @@ bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_token
             positions[i] = n_past + i;
         }
         ggml_backend_tensor_set(inp_pos, positions.data(), 0, n_tokens * sizeof(int32_t));
+    }
+
+    // Causal mask for FA prefill — only present when QWEN3_TTS_PREFILL_FA is set.
+    // Shape [n_ctx, n_tokens]: row q is the mask for query token at pos n_past+q.
+    struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
+    if (inp_mask) {
+        const int32_t n_ctx = state_.cache.n_ctx;
+        std::vector<ggml_fp16_t> mask((size_t)n_tokens * n_ctx, ggml_fp32_to_fp16(-INFINITY));
+        for (int q = 0; q < n_tokens; ++q) {
+            const int q_pos = n_past + q;
+            const int kv_end = std::min(q_pos + 1, n_ctx);
+            for (int k = 0; k < kv_end; ++k) {
+                mask[(size_t)q * n_ctx + k] = ggml_fp32_to_fp16(0.0f);
+            }
+        }
+        ggml_backend_tensor_set(inp_mask, mask.data(),
+                                0, (size_t)n_tokens * n_ctx * sizeof(ggml_fp16_t));
     }
 
 #ifdef QWEN3_TTS_TIMING
