@@ -1042,11 +1042,25 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // openai text limit is 4096 chars
-        if (input.size() > 4096) {
+        // Input length cap. OpenAI's spec says 4096, but qwen3-tts has a
+        // 4096-token context, and English averages ~3.5 chars/token, so we
+        // can comfortably accept ~6000 chars and still leave room for the
+        // generated codec frames + ICL framing in the talker KV cache. The
+        // env override exists for callers who want longer paragraphs or
+        // multi-paragraph blocks (which preserve mid-block prosody better
+        // than sentence-by-sentence streaming). Set 0 to disable the cap.
+        size_t max_input_chars = 6144;
+        if (const char * env = std::getenv("QWEN3_TTS_MAX_INPUT_CHARS")) {
+            char * end = nullptr;
+            long v = std::strtol(env, &end, 10);
+            if (end && end != env && v >= 0) max_input_chars = (size_t) v;
+        }
+        if (max_input_chars > 0 && input.size() > max_input_chars) {
             res.status = 400;
-            res.set_content(R"({"error":{"message":"'input' exceeds 4096 characters","type":"invalid_request_error"}})",
-                            "application/json");
+            std::string msg = "'input' exceeds " + std::to_string(max_input_chars) +
+                              " characters (raise QWEN3_TTS_MAX_INPUT_CHARS to allow longer blocks)";
+            json err = {{"error", {{"message", msg}, {"type", "invalid_request_error"}}}};
+            res.set_content(err.dump(), "application/json");
             return;
         }
 
