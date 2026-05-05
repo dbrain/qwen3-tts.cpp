@@ -19,6 +19,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <string>
@@ -45,19 +47,11 @@ static int language_to_id(const std::string & lang) {
     return -1;
 }
 
-// FNV-1a 64-bit over arbitrary bytes. Used to key the on-disk voice
-// derived-artifact cache by (model_id || ref_wav_bytes).
-static uint64_t fnv1a_64(const void * data, size_t n) {
-    const uint8_t * p = static_cast<const uint8_t *>(data);
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
-    return h;
-}
-
-// Voice bundle: cached speaker embedding + ICL ref_codes derived from a
-// reference WAV. Persisting this lets the C++ server skip the speaker
-// encoder + codec encoder forward passes on every cold spawn (~50-200 ms
-// each per voice), and survives wrapper restarts.
+// Voice bundle: persistent speaker embedding + ICL ref_codes derived
+// once from a reference WAV. The bundle is the canonical voice
+// representation; WAV is just the ingest format. Persisting this lets
+// the C++ server skip the speaker encoder + codec encoder forward
+// passes on every startup (~50-200 ms each per voice).
 //
 // Disk format (little-endian, host-aligned):
 //   magic[4]      = "QTVB"
@@ -144,17 +138,21 @@ static bool voice_bundle_write(const std::string & path, const voice_bundle & b)
     return true;
 }
 
-static std::string voice_cache_path(const std::string & dir,
-                                     const std::string & model_id,
-                                     const std::string & wav_bytes) {
-    if (dir.empty()) return "";
-    std::string seed = model_id;
-    seed.push_back('\0');
-    seed.append(wav_bytes);
-    uint64_t h = fnv1a_64(seed.data(), seed.size());
-    char name[40];
-    snprintf(name, sizeof(name), "%016llx.bundle", (unsigned long long) h);
-    return dir + "/" + name;
+// Canonical voice-archive layout (per voice):
+//   <archive>/<name>/voice.bundle    - PRIMARY: speaker embedding + ref_codes (binary)
+//   <archive>/<name>/ref_text.txt    - optional: transcript for ICL
+//   <archive>/<name>/description.txt - optional: description text for VoiceDesign
+//   <archive>/<name>/ref.wav         - optional: WAV kept for user replay only
+//
+// The WAV is never read at synth time — embeds + codes are the persistent
+// representation. WAV is only the ingest format and an optional preview.
+static std::string voice_dir_path(const std::string & archive_dir, const std::string & name) {
+    if (archive_dir.empty() || name.empty()) return "";
+    return archive_dir + "/" + name;
+}
+static std::string voice_bundle_path(const std::string & archive_dir, const std::string & name) {
+    if (archive_dir.empty() || name.empty()) return "";
+    return archive_dir + "/" + name + "/voice.bundle";
 }
 
 // encode float32 audio samples as a WAV byte buffer (16-bit PCM)
@@ -555,22 +553,79 @@ int main(int argc, char ** argv) {
     // synthesis is not thread-safe, serialize all requests
     std::mutex synth_mutex;
 
-    // custom voice store (voice_id -> voice data)
+    // custom voice store. Keyed by voice name (which is also the upstream
+    // ID — register-voice now uses the supplied name as the ID directly,
+    // so wrappers / clients can refer to a voice by its human name without
+    // a translation layer).
     std::map<std::string, custom_voice> voices;
     std::mutex voices_mutex;
-    int next_voice_id = 1;
 
-    // optional on-disk cache of derived voice artifacts (speaker embedding +
-    // ref_codes), keyed by FNV-1a 64 of (model_id || ref_wav_bytes). Skips
-    // the speaker-encoder + codec-encoder forward passes on cold spawn when
-    // the same WAV has been registered against the same model before.
-    std::string voice_cache_dir;
-    if (const char * env = std::getenv("QWEN3_TTS_VOICE_CACHE_DIR")) {
-        voice_cache_dir = env;
+    // Voice archive directory. WAV is the *ingest* format; the persistent
+    // representation is the binary bundle (speaker embedding + ICL ref_codes).
+    // Layout per voice:
+    //   <archive>/<name>/voice.bundle    PRIMARY: embed + codes
+    //   <archive>/<name>/ref_text.txt    optional, ICL transcript
+    //   <archive>/<name>/description.txt optional, VoiceDesign description
+    //   <archive>/<name>/sample.wav      optional, kept for user replay only
+    //
+    // On startup, every subdir with a model-matching voice.bundle is loaded
+    // directly into the voices map (host-only, no GPU touched). On register
+    // (POST /v1/audio/voices), the server owns the full lifecycle: encode the
+    // input WAV once, write voice.bundle (and optionally save sample.wav),
+    // skip encoders forever after.
+    std::string voice_archive_dir;
+    if (const char * env = std::getenv("QWEN3_TTS_VOICE_ARCHIVE_DIR")) {
+        voice_archive_dir = env;
     }
-    if (!voice_cache_dir.empty()) {
-        ::mkdir(voice_cache_dir.c_str(), 0755);
-        fprintf(stderr, "voice cache dir: %s\n", voice_cache_dir.c_str());
+    if (!voice_archive_dir.empty()) {
+        ::mkdir(voice_archive_dir.c_str(), 0755);
+        fprintf(stderr, "voice archive dir: %s\n", voice_archive_dir.c_str());
+
+        if (std::filesystem::is_directory(voice_archive_dir)) {
+            int loaded = 0, deferred = 0;
+            std::error_code ec;
+            for (const auto & entry : std::filesystem::directory_iterator(voice_archive_dir, ec)) {
+                if (ec) break;
+                if (!entry.is_directory()) continue;
+                const std::string name = entry.path().filename().string();
+                if (name.empty() || name[0] == '.') continue;
+                const auto bundle = entry.path() / "voice.bundle";
+                if (!std::filesystem::exists(bundle)) {
+                    fprintf(stderr, "  voice-archive: '%s' deferred (no voice.bundle yet)\n",
+                            name.c_str());
+                    deferred++;
+                    continue;
+                }
+                voice_bundle b;
+                if (!voice_bundle_read(bundle.string(), b) || b.model_id != model_id) {
+                    fprintf(stderr, "  voice-archive: '%s' bundle stale (model_id mismatch), deferred\n",
+                            name.c_str());
+                    deferred++;
+                    continue;
+                }
+                std::string ref_text;
+                const auto text_path = entry.path() / "ref_text.txt";
+                if (std::filesystem::exists(text_path)) {
+                    std::ifstream tin(text_path);
+                    std::string line, all;
+                    while (std::getline(tin, line)) all += line + "\n";
+                    while (!all.empty() && (all.back() == '\n' || all.back() == '\r' || all.back() == ' ')) all.pop_back();
+                    ref_text = std::move(all);
+                }
+                voices[name] = {
+                    name,
+                    b.has_embedding ? std::move(b.embedding) : std::vector<float>(),
+                    ref_text,
+                    b.has_codes ? std::move(b.ref_codes) : std::vector<int32_t>(),
+                    b.has_codes ? b.n_ref_frames : 0,
+                };
+                fprintf(stderr, "  voice-archive: loaded '%s' (embed=%d, codes=%d frames)\n",
+                        name.c_str(), b.has_embedding ? 1 : 0,
+                        b.has_codes ? b.n_ref_frames : 0);
+                loaded++;
+            }
+            fprintf(stderr, "voice archive: %d loaded, %d deferred\n", loaded, deferred);
+        }
     }
 
     // idle-unload watchdog: when QWEN3_TTS_IDLE_UNLOAD_SECONDS > 0, a
@@ -697,8 +752,8 @@ int main(int argc, char ** argv) {
 
     // --- POST /v1/audio/voices --- create custom voice from reference audio
     svr.Post("/v1/audio/voices",
-        [&tts, &synth_mutex, &voices, &voices_mutex, &next_voice_id,
-         &voice_cache_dir, &model_id, &ensure_loaded_locked](const httplib::Request & req, httplib::Response & res) {
+        [&tts, &synth_mutex, &voices, &voices_mutex,
+         &voice_archive_dir, &model_id, &ensure_loaded_locked](const httplib::Request & req, httplib::Response & res) {
 
         // runtime audio cloning needs the speaker encoder, which only ships in the Base variant
         if (!tts.has_speaker_encoder()) {
@@ -743,12 +798,13 @@ int main(int argc, char ** argv) {
         if (req.has_param("ref_text")) ref_text = req.get_param_value("ref_text");
         if (req.has_file("ref_text")) ref_text = req.get_file_value("ref_text").content;
 
-        // disk cache: try to skip encoder forward passes by loading
-        // previously-derived embedding + ref_codes for this WAV.
-        const std::string cache_path = voice_cache_path(voice_cache_dir, model_id, audio_file.content);
+        // archive lookup by name: if voice.bundle exists for this name and
+        // matches the current model, skip the encoder forward passes.
+        const std::string voice_dir   = voice_dir_path(voice_archive_dir, name);
+        const std::string bundle_path = voice_bundle_path(voice_archive_dir, name);
         voice_bundle cached;
-        const bool cache_hit = !cache_path.empty() &&
-                               voice_bundle_read(cache_path, cached) &&
+        const bool cache_hit = !bundle_path.empty() &&
+                               voice_bundle_read(bundle_path, cached) &&
                                cached.model_id == model_id;
         const bool need_codes = !ref_text.empty();
         bool used_cached_embed = false;
@@ -857,24 +913,25 @@ int main(int argc, char ** argv) {
 
         unlink(tmppath);
 
-        // log cache decision
-        if (!voice_cache_dir.empty()) {
+        if (!voice_archive_dir.empty()) {
             fprintf(stderr,
-                    "voice-cache: %s (embed=%s, codes=%s) %s\n",
+                    "voice-archive: %s '%s' (embed=%s, codes=%s)\n",
                     cache_hit ? "HIT" : "MISS",
+                    name.c_str(),
                     used_cached_embed ? "cached" : "encoded",
-                    need_codes ? (used_cached_codes ? "cached" : "encoded") : "skip",
-                    cache_path.c_str());
+                    need_codes ? (used_cached_codes ? "cached" : "encoded") : "skip");
         }
 
-        // persist any newly-computed artifacts (or partial-hit upgrades).
-        // Preserve previously-cached artifacts that we didn't recompute on
-        // this request (e.g. cached codes when register-without-ref_text).
-        if (!cache_path.empty()) {
+        // Persist to the canonical archive layout. Always write if anything
+        // was newly computed; preserve cached fields we didn't recompute
+        // (e.g. register-without-ref_text on a voice with prior codes).
+        if (!voice_archive_dir.empty() && !voice_dir.empty()) {
             const bool need_write =
                 (!used_cached_embed && !embedding.empty()) ||
                 (need_codes && !used_cached_codes && !ref_codes.empty());
+
             if (need_write) {
+                ::mkdir(voice_dir.c_str(), 0755);  // idempotent
                 voice_bundle out;
                 out.model_id = model_id;
                 if (!embedding.empty()) {
@@ -887,24 +944,37 @@ int main(int argc, char ** argv) {
                     out.n_ref_frames = n_ref_frames;
                     out.n_codebooks  = n_codebooks;
                 } else if (cache_hit && cached.has_codes) {
-                    // preserve previously-cached codes (e.g. registered
-                    // without ref_text now, but had codes from a prior pass)
                     out.has_codes    = true;
                     out.ref_codes    = cached.ref_codes;
                     out.n_ref_frames = cached.n_ref_frames;
                     out.n_codebooks  = cached.n_codebooks;
                 }
-                if (!voice_bundle_write(cache_path, out)) {
-                    fprintf(stderr, "  voice-cache: failed to write %s\n", cache_path.c_str());
+                if (!voice_bundle_write(bundle_path, out)) {
+                    fprintf(stderr, "  voice-archive: failed to write %s\n", bundle_path.c_str());
+                }
+
+                // ref.wav (optional). Kept only for user replay / preview
+                // and wrapper-compat re-upload during migration; never
+                // read at synth time. Embeds + codes are the source of
+                // truth from voice.bundle.
+                const std::string sample_path = voice_dir + "/ref.wav";
+                if (!std::filesystem::exists(sample_path)) {
+                    std::ofstream sw(sample_path, std::ios::binary);
+                    if (sw) sw.write(audio_file.content.data(),
+                                     (std::streamsize) audio_file.content.size());
+                }
+                if (!ref_text.empty()) {
+                    std::ofstream tw(voice_dir + "/ref_text.txt");
+                    if (tw) tw << ref_text;
                 }
             }
         }
 
-        // store voice
-        std::string voice_id;
+        // store voice — voice_id == human name; existing entry (e.g. from
+        // startup archive scan or a prior register) is replaced.
+        const std::string voice_id = name;
         {
             std::lock_guard<std::mutex> lock(voices_mutex);
-            voice_id = "voice_" + std::to_string(next_voice_id++);
             voices[voice_id] = {name, std::move(embedding), ref_text,
                                 std::move(ref_codes), n_ref_frames};
         }
