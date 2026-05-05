@@ -222,9 +222,31 @@ public:
     
     // Initialize KV cache
     bool init_kv_cache(int32_t n_ctx);
-    
+
     // Clear KV cache
     void clear_kv_cache();
+
+    // Snapshot of K/V cache contents for the first `n_pos` positions across
+    // all 28 layers. Bytes are F16, packed [head_dim, n_kv_heads, n_pos] per
+    // layer. Used to seed the talker prefill with cached prefix state on
+    // requests that share an instruct + ref_text + speaker prefix.
+    struct prefill_kv_snapshot {
+        int32_t n_pos = 0;
+        std::vector<std::vector<uint8_t>> k_layers; // size = n_layers
+        std::vector<std::vector<uint8_t>> v_layers;
+    };
+
+    // Capture current KV cache contents for positions [0, n_pos) into the
+    // snapshot. Cheap — one ggml_backend_tensor_get per layer per K/V (so
+    // 56 small downloads; for 28 layers x 8 heads x 128 head_dim x 60 pos
+    // x 2 (F16) ≈ 7 MB total).
+    bool capture_kv_state(int32_t n_pos, prefill_kv_snapshot & out);
+
+    // Restore KV cache: write `snap.k_layers[il]` and `snap.v_layers[il]`
+    // into positions [0, snap.n_pos) of each layer, then zero positions
+    // [snap.n_pos, n_ctx) so subsequent forward_prefill cannot read stale
+    // bytes through full-n_ctx views. Sets state_.cache.n_used = snap.n_pos.
+    bool restore_kv_state(const prefill_kv_snapshot & snap);
     
     // Initialize code predictor KV cache (5 layers, max 16 context)
     bool init_code_pred_kv_cache(int32_t n_ctx);
@@ -292,7 +314,17 @@ public:
                   const int32_t * ref_text_tokens = nullptr,
                   int32_t n_ref_text_tokens = 0,
                   const int32_t * ref_codes = nullptr,
-                  int32_t n_ref_frames = 0);
+                  int32_t n_ref_frames = 0,
+                  // Voice-keyed prefill cache: when non-zero, generate()
+                  // looks up cached talker KV state from prior invocations
+                  // with the same key (= same instruct + ref_text + speaker
+                  // prefix) and skips the prefix forward-pass. Caching is
+                  // bounded to the [prefix..end-of-ref_text] window — the
+                  // request's new_text and ref_codes section always run.
+                  uint64_t prefill_cache_key = 0);
+
+    // Drop all cached prefill KV snapshots. Called by Qwen3TTS::unload_model.
+    void clear_prefill_kv_cache();
     
     const tts_transformer_config & get_config() const { return model_.config; }
 
@@ -355,7 +387,13 @@ private:
                              const int32_t * ref_text_tokens = nullptr,
                              int32_t n_ref_text_tokens = 0,
                              const int32_t * ref_codes = nullptr,
-                             int32_t n_ref_frames = 0);
+                             int32_t n_ref_frames = 0,
+                             // out: number of leading positions in
+                             // prefill_embd whose KV state is voice-bound
+                             // and safe to cache (= prefix + ref_text in
+                             // ICL mode; prefix only otherwise; 0 means
+                             // nothing cacheable).
+                             int32_t * cacheable_len = nullptr);
 
     struct ggml_cgraph * build_prefill_forward_graph(int32_t n_tokens, int32_t n_past);
 
@@ -403,6 +441,21 @@ private:
     int32_t last_n_prefill_tokens_ = 0;
     int64_t last_prefill_ms_ = 0;
     int64_t last_decode_ms_ = 0;
+
+    // Voice-keyed prefill KV cache. Looked up + populated inside generate()
+    // when the caller passes prefill_cache_key. Bounded eviction (LRU,
+    // capacity 16) keeps host-memory use manageable (~7 MB per entry at
+    // typical ICL prefix lengths).
+    std::map<uint64_t, prefill_kv_snapshot> prefill_kv_cache_;
+    std::vector<uint64_t> prefill_kv_cache_lru_;  // front = oldest
+    static constexpr size_t kPrefillKvCacheCapacity = 16;
+
+    // Per-voice cache of the icl_codec_section embedding bytes built by
+    // build_prefill_graph (codec_bos + Σ ref_code embeddings, overlayed with
+    // tts_pad_embed). Keyed by FNV-1a hash of ref_codes content. Avoids the
+    // 1072 single-row D2H embedding lookups that dominate voice_clone build
+    // cost (~400 ms on Q4_K_M for 67 frames × 16 codebooks).
+    std::map<uint64_t, std::vector<float>> icl_codec_section_cache_;
 
     // Cached hidden states from last forward pass
     std::vector<float> last_hidden_;

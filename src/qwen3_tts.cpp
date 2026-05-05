@@ -673,6 +673,42 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
             });
     }
 
+    // Voice-keyed prefill cache key. Hash everything that determines the
+    // cacheable [prefix..end-of-ref_text] portion of the prefill assembly:
+    // language, ICL flag, has_speaker, the speaker embedding bytes, the
+    // instruct tokens, and the ref_text tokens. Anything past ref_text
+    // (new_text, codec_bos, ref_codes) is per-request and excluded.
+    uint64_t prefill_cache_key = 0;
+    {
+        const bool icl_mode    = (ref_codes && n_ref_frames > 0 && !ref_text_tokens.empty());
+        const bool has_speaker = (speaker_embedding != nullptr);
+        const int32_t hsize    = transformer_.get_config().hidden_size;
+        uint64_t h = 1469598103934665603ull; // FNV-1a 64 offset basis
+        auto add = [&h](const void * data, size_t n) {
+            const uint8_t * p = static_cast<const uint8_t *>(data);
+            for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+        };
+        int32_t lang  = params.language_id;
+        uint8_t flags = (uint8_t) ((has_speaker ? 1 : 0) | (icl_mode ? 2 : 0));
+        add(&lang,  sizeof(lang));
+        add(&flags, sizeof(flags));
+        if (has_speaker) {
+            add(speaker_embedding, (size_t) hsize * sizeof(float));
+        }
+        int32_t n_inst = (int32_t) instruct_tokens.size();
+        add(&n_inst, sizeof(n_inst));
+        if (n_inst > 0) {
+            add(instruct_tokens.data(), (size_t) n_inst * sizeof(int32_t));
+        }
+        int32_t n_reft = (int32_t) ref_text_tokens.size();
+        add(&n_reft, sizeof(n_reft));
+        if (n_reft > 0) {
+            add(ref_text_tokens.data(), (size_t) n_reft * sizeof(int32_t));
+        }
+        prefill_cache_key = h;
+        if (prefill_cache_key == 0) prefill_cache_key = 1; // 0 reserved for "no cache"
+    }
+
     std::vector<int32_t> speech_codes;
     if (!transformer_.generate(text_tokens.data(), (int32_t)text_tokens.size(),
                                speaker_embedding, params.max_audio_tokens, speech_codes,
@@ -682,7 +718,8 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                                (int32_t)instruct_tokens.size(),
                                ref_text_tokens.empty() ? nullptr : ref_text_tokens.data(),
                                (int32_t)ref_text_tokens.size(),
-                               ref_codes, n_ref_frames)) {
+                               ref_codes, n_ref_frames,
+                               prefill_cache_key)) {
         if (streaming) transformer_.set_frame_callback({});
         result.error_msg = "Failed to generate speech codes: " + transformer_.get_error();
         return result;

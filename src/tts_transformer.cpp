@@ -49,6 +49,9 @@ void TTSTransformer::unload_model() {
     state_.compute_meta.clear();
     last_hidden_.clear();
     embd_row_fp16_scratch_.clear();
+    prefill_kv_cache_.clear();
+    prefill_kv_cache_lru_.clear();
+    icl_codec_section_cache_.clear();
 }
 
 bool TTSTransformer::load_model(const std::string & model_path) {
@@ -828,6 +831,95 @@ void TTSTransformer::clear_kv_cache() {
     }
 }
 
+// --- Talker prefill KV cache (item D in HANDOFF-perf-5) -------------------
+
+// Bytes per cached position per layer per K-or-V tensor.
+// Cache layout = [head_dim, n_kv_heads, n_pos] of F16, so per-position
+// stride = head_dim * n_kv_heads * sizeof(ggml_fp16_t).
+static inline size_t kv_pos_stride(const tts_kv_cache & cache) {
+    return (size_t) cache.head_dim * cache.n_kv_heads * sizeof(uint16_t);
+}
+
+bool TTSTransformer::capture_kv_state(int32_t n_pos, prefill_kv_snapshot & out) {
+    if (n_pos <= 0) {
+        error_msg_ = "capture_kv_state: n_pos must be > 0";
+        return false;
+    }
+    if (state_.cache.k_cache.empty() || state_.cache.n_ctx <= 0) {
+        error_msg_ = "capture_kv_state: kv cache not initialized";
+        return false;
+    }
+    if (n_pos > state_.cache.n_ctx) {
+        error_msg_ = "capture_kv_state: n_pos exceeds n_ctx";
+        return false;
+    }
+    const size_t stride = kv_pos_stride(state_.cache);
+    const size_t bytes  = stride * (size_t) n_pos;
+    const int n_layers  = (int) state_.cache.k_cache.size();
+    out.n_pos = n_pos;
+    out.k_layers.assign(n_layers, std::vector<uint8_t>(bytes));
+    out.v_layers.assign(n_layers, std::vector<uint8_t>(bytes));
+    for (int il = 0; il < n_layers; ++il) {
+        ggml_backend_tensor_get(state_.cache.k_cache[il],
+                                out.k_layers[il].data(), 0, bytes);
+        ggml_backend_tensor_get(state_.cache.v_cache[il],
+                                out.v_layers[il].data(), 0, bytes);
+    }
+    return true;
+}
+
+bool TTSTransformer::restore_kv_state(const prefill_kv_snapshot & snap) {
+    if (snap.n_pos <= 0) {
+        error_msg_ = "restore_kv_state: empty snapshot";
+        return false;
+    }
+    if (state_.cache.k_cache.empty() || state_.cache.n_ctx <= 0) {
+        error_msg_ = "restore_kv_state: kv cache not initialized";
+        return false;
+    }
+    if (snap.n_pos > state_.cache.n_ctx) {
+        error_msg_ = "restore_kv_state: n_pos exceeds n_ctx";
+        return false;
+    }
+    const int n_layers = (int) state_.cache.k_cache.size();
+    if ((int) snap.k_layers.size() != n_layers ||
+        (int) snap.v_layers.size() != n_layers) {
+        error_msg_ = "restore_kv_state: layer count mismatch";
+        return false;
+    }
+    const size_t stride = kv_pos_stride(state_.cache);
+    const size_t bytes  = stride * (size_t) snap.n_pos;
+    for (int il = 0; il < n_layers; ++il) {
+        if (snap.k_layers[il].size() != bytes ||
+            snap.v_layers[il].size() != bytes) {
+            error_msg_ = "restore_kv_state: snapshot byte size mismatch";
+            return false;
+        }
+        // Write cached prefix.
+        ggml_backend_tensor_set(state_.cache.k_cache[il],
+                                snap.k_layers[il].data(), 0, bytes);
+        ggml_backend_tensor_set(state_.cache.v_cache[il],
+                                snap.v_layers[il].data(), 0, bytes);
+        // Zero the rest of the cache so subsequent forward_prefill cannot
+        // read stale bytes past n_pos through full-n_ctx attention views.
+        const size_t total = ggml_nbytes(state_.cache.k_cache[il]);
+        if (total > bytes) {
+            ggml_backend_tensor_memset(state_.cache.k_cache[il], 0, bytes,
+                                       total - bytes);
+            ggml_backend_tensor_memset(state_.cache.v_cache[il], 0, bytes,
+                                       total - bytes);
+        }
+    }
+    state_.cache.n_used = snap.n_pos;
+    return true;
+}
+
+void TTSTransformer::clear_prefill_kv_cache() {
+    prefill_kv_cache_.clear();
+    prefill_kv_cache_lru_.clear();
+    icl_codec_section_cache_.clear();
+}
+
 bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
     const auto & cfg = model_.config;
     
@@ -1089,7 +1181,9 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
                                          const int32_t * ref_text_tokens,
                                          int32_t n_ref_text_tokens,
                                          const int32_t * ref_codes,
-                                         int32_t n_ref_frames) {
+                                         int32_t n_ref_frames,
+                                         int32_t * cacheable_len) {
+    if (cacheable_len) *cacheable_len = 0;
     if (!text_tokens) {
         error_msg_ = "text_tokens is null";
         return false;
@@ -1273,53 +1367,95 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         // codebooks 1-15: model_.code_pred_embd[cb-1]
         const int32_t codec_section_len = 1 + n_ref_frames; // codec_bos + ref_codes
         std::vector<float> icl_codec_section((size_t)codec_section_len * hidden_size, 0.0f);
+        const bool skip_ref_codes = std::getenv("QWEN3_TTS_SKIP_REF_CODES") != nullptr;
 
-        // codec_bos overlaid with tts_pad
-        {
-            int32_t bos_tok = cfg.codec_bos_id;
-            std::vector<float> bos_emb;
-            if (!lookup_embedding_rows(model_.codec_embd, &bos_tok, 1,
-                                       "inp_icl_codec_bos", "icl_codec_bos_emb", bos_emb)) {
-                return false;
+        // Per-voice cache lookup. The icl_codec_section bytes depend only on
+        // ref_codes content, n_codebooks, and the model (which is implicitly
+        // pinned to the lifetime of icl_codec_section_cache_). Hash the
+        // ref_codes contents and skip the embedding loop on cache hit —
+        // saves ~400 ms on Q4_K_M voice_clone (1072 small D2H copies).
+        bool codec_section_cached = false;
+        uint64_t ref_codes_hash = 0;
+        if (!skip_ref_codes) {
+            const size_t ref_codes_bytes =
+                (size_t) n_ref_frames * cfg.n_codebooks * sizeof(int32_t);
+            uint64_t h = 1469598103934665603ull;
+            const uint8_t * p = reinterpret_cast<const uint8_t *>(ref_codes);
+            for (size_t i = 0; i < ref_codes_bytes; ++i) {
+                h ^= p[i];
+                h *= 1099511628211ull;
             }
-            float * dst = icl_codec_section.data();
-            for (int32_t h = 0; h < hidden_size; ++h) {
-                dst[h] = bos_emb[h] + tts_pad_embed[h];
+            // Also mix n_ref_frames + n_codebooks so a different layout
+            // can't alias under the same byte sequence.
+            int32_t mix[2] = { n_ref_frames, cfg.n_codebooks };
+            const uint8_t * mp = reinterpret_cast<const uint8_t *>(mix);
+            for (size_t i = 0; i < sizeof(mix); ++i) {
+                h ^= mp[i];
+                h *= 1099511628211ull;
+            }
+            ref_codes_hash = h;
+            auto it = icl_codec_section_cache_.find(ref_codes_hash);
+            if (it != icl_codec_section_cache_.end() &&
+                it->second.size() == icl_codec_section.size()) {
+                memcpy(icl_codec_section.data(), it->second.data(),
+                       it->second.size() * sizeof(float));
+                codec_section_cached = true;
             }
         }
 
-        // ref_code embeddings: sum across codebooks, overlay with tts_pad
-        const bool skip_ref_codes = std::getenv("QWEN3_TTS_SKIP_REF_CODES") != nullptr;
-        std::vector<float> embd_row(hidden_size);
-        for (int32_t f = 0; f < n_ref_frames; ++f) {
-            if (skip_ref_codes) {
-                float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
-                for (int32_t h = 0; h < hidden_size; ++h) dst[h] = tts_pad_embed[h];
-                continue;
-            }
-            float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
-
-            // sum codebook embeddings for this frame
-            for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
-                int32_t code = ref_codes[f * cfg.n_codebooks + cb];
-                if (cb == 0) {
-                    if (!lookup_single_embedding_row(model_.codec_embd, code, embd_row.data())) {
-                        return false;
-                    }
-                } else {
-                    if ((int)model_.code_pred_embd.size() < cb) continue;
-                    if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code, embd_row.data())) {
-                        return false;
-                    }
+        if (!codec_section_cached) {
+            // codec_bos overlaid with tts_pad
+            {
+                int32_t bos_tok = cfg.codec_bos_id;
+                std::vector<float> bos_emb;
+                if (!lookup_embedding_rows(model_.codec_embd, &bos_tok, 1,
+                                           "inp_icl_codec_bos", "icl_codec_bos_emb", bos_emb)) {
+                    return false;
                 }
+                float * dst = icl_codec_section.data();
                 for (int32_t h = 0; h < hidden_size; ++h) {
-                    dst[h] += embd_row[h];
+                    dst[h] = bos_emb[h] + tts_pad_embed[h];
                 }
             }
 
-            // overlay with tts_pad_embed
-            for (int32_t h = 0; h < hidden_size; ++h) {
-                dst[h] += tts_pad_embed[h];
+            // ref_code embeddings: sum across codebooks, overlay with tts_pad
+            std::vector<float> embd_row(hidden_size);
+            for (int32_t f = 0; f < n_ref_frames; ++f) {
+                if (skip_ref_codes) {
+                    float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
+                    for (int32_t h = 0; h < hidden_size; ++h) dst[h] = tts_pad_embed[h];
+                    continue;
+                }
+                float * dst = icl_codec_section.data() + (size_t)(1 + f) * hidden_size;
+
+                // sum codebook embeddings for this frame
+                for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
+                    int32_t code = ref_codes[f * cfg.n_codebooks + cb];
+                    if (cb == 0) {
+                        if (!lookup_single_embedding_row(model_.codec_embd, code, embd_row.data())) {
+                            return false;
+                        }
+                    } else {
+                        if ((int)model_.code_pred_embd.size() < cb) continue;
+                        if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code, embd_row.data())) {
+                            return false;
+                        }
+                    }
+                    for (int32_t h = 0; h < hidden_size; ++h) {
+                        dst[h] += embd_row[h];
+                    }
+                }
+
+                // overlay with tts_pad_embed
+                for (int32_t h = 0; h < hidden_size; ++h) {
+                    dst[h] += tts_pad_embed[h];
+                }
+            }
+
+            // Store for next time. Bounded by callers; clear_prefill_kv_cache
+            // (called from unload_model) drops stale entries on quant switch.
+            if (!skip_ref_codes && ref_codes_hash != 0) {
+                icl_codec_section_cache_[ref_codes_hash] = icl_codec_section;
             }
         }
 
@@ -1344,6 +1480,15 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         // in ICL mode, trailing is just tts_pad_embed (all text already in prefill)
         trailing_text_hidden.resize(hidden_size);
         memcpy(trailing_text_hidden.data(), tts_pad_embed.data(), hidden_size * sizeof(float));
+
+        // ICL mode cacheable window: [prefix, ref_text]. The ref_text rows
+        // come immediately after prefix in icl_text_section and depend only
+        // on ref_text_tokens + voice — independent of new_text. Anything
+        // after (new_text, tts_eos, codec_bos, ref_codes) attends through
+        // new_text via the causal mask, so its KV is per-request.
+        if (cacheable_len) {
+            *cacheable_len = prefix_len + n_ref_text_tokens;
+        }
     } else {
         // ── non-ICL prefill (existing path) ──────────────────────────
         const int32_t prefill_len = n_instruct_tokens + 3 + codec_plus_overlay_len + 1;
@@ -1374,6 +1519,13 @@ bool TTSTransformer::build_prefill_graph(const int32_t * text_tokens, int32_t n_
         }
         memcpy(trailing_text_hidden.data() + (size_t)(trailing_len - 1) * hidden_size,
                tts_eos_embed.data(), hidden_size * sizeof(float));
+
+        // non-ICL mode cacheable window: [instruct, role, codec_overlay].
+        // Only the final position — first_text_plus_codec_bos — varies with
+        // the user's text, so cache up through prefill_len-1.
+        if (cacheable_len) {
+            *cacheable_len = prefill_len - 1;
+        }
     }
 
     return true;
@@ -2840,7 +2992,8 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                                const int32_t * ref_text_tokens,
                                int32_t n_ref_text_tokens,
                                const int32_t * ref_codes,
-                               int32_t n_ref_frames) {
+                               int32_t n_ref_frames,
+                               uint64_t prefill_cache_key) {
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
     tts_timing timing = {};
@@ -2886,11 +3039,13 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     const int64_t t_gen_start_ms = verbose_now_ms();
     int64_t t_prefill_end_ms = t_gen_start_ms;
     int64_t t_prefill_build_start = verbose_ ? verbose_now_ms() : 0;
+    int32_t cacheable_len = 0;
     if (!build_prefill_graph(text_tokens, n_tokens, speaker_embd, language_id,
                              prefill_embd, trailing_text_hidden, tts_pad_embed,
                              instruct_tokens, n_instruct_tokens,
                              ref_text_tokens, n_ref_text_tokens,
-                             ref_codes, n_ref_frames)) {
+                             ref_codes, n_ref_frames,
+                             &cacheable_len)) {
         return false;
     }
 #ifdef QWEN3_TTS_TIMING
@@ -2902,8 +3057,9 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     const int32_t trailing_len = (int32_t)(trailing_text_hidden.size() / cfg.hidden_size);
 
     if (verbose_) {
-        fprintf(stderr, "  prefill build: %lld ms (prefill_len=%d, trailing_len=%d)\n",
-                (long long)(verbose_now_ms() - t_prefill_build_start), prefill_len, trailing_len);
+        fprintf(stderr, "  prefill build: %lld ms (prefill_len=%d, trailing_len=%d, cacheable_len=%d)\n",
+                (long long)(verbose_now_ms() - t_prefill_build_start),
+                prefill_len, trailing_len, cacheable_len);
     }
 
     const int32_t required_ctx = prefill_len + max_len + 8;
@@ -2914,8 +3070,44 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         if (!init_kv_cache(required_ctx)) {
             return false;
         }
+        // n_ctx changed → cached snapshots are still valid (host-side stores
+        // are sized per-position, not per-n_ctx) but n_used was zeroed by
+        // free_tts_kv_cache, so subsequent restore must re-set it.
     }
-    clear_kv_cache();
+
+    // Look up per-voice cached prefix KV. On HIT we skip forwarding the
+    // first `cacheable_len` positions; we only forward [cacheable_len..end).
+    bool cache_hit = false;
+    int32_t prefill_n_past = 0;
+    if (prefill_cache_key != 0 && cacheable_len > 0 &&
+        cacheable_len < prefill_len) {
+        auto it = prefill_kv_cache_.find(prefill_cache_key);
+        if (it != prefill_kv_cache_.end() && it->second.n_pos == cacheable_len) {
+            if (restore_kv_state(it->second)) {
+                cache_hit = true;
+                prefill_n_past = cacheable_len;
+                if (verbose_) {
+                    fprintf(stderr, "  prefill cache HIT (key=%016llx, n_pos=%d)\n",
+                            (unsigned long long) prefill_cache_key, cacheable_len);
+                }
+                // Move key to LRU back (most recent).
+                auto lru_it = std::find(prefill_kv_cache_lru_.begin(),
+                                        prefill_kv_cache_lru_.end(),
+                                        prefill_cache_key);
+                if (lru_it != prefill_kv_cache_lru_.end()) {
+                    prefill_kv_cache_lru_.erase(lru_it);
+                }
+                prefill_kv_cache_lru_.push_back(prefill_cache_key);
+            } else if (verbose_) {
+                fprintf(stderr, "  prefill cache RESTORE failed: %s\n",
+                        get_error().c_str());
+            }
+        }
+    }
+
+    if (!cache_hit) {
+        clear_kv_cache();
+    }
 
     std::vector<float> hidden_out;
     std::vector<float> logits;
@@ -2924,12 +3116,56 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     t0 = clk::now();
 #endif
     int64_t t_prefill_fwd_start = verbose_ ? verbose_now_ms() : 0;
-    if (!forward_prefill(prefill_embd.data(), prefill_len, 0, hidden_out, &logits)) {
+    const int32_t prefill_remaining = prefill_len - prefill_n_past;
+    const float * prefill_remaining_data =
+        prefill_embd.data() + (size_t) prefill_n_past * cfg.hidden_size;
+    if (!forward_prefill(prefill_remaining_data, prefill_remaining,
+                         prefill_n_past, hidden_out, &logits)) {
         return false;
     }
     if (verbose_) {
-        fprintf(stderr, "  prefill forward: %lld ms\n",
-                (long long)(verbose_now_ms() - t_prefill_fwd_start));
+        fprintf(stderr, "  prefill forward: %lld ms (forwarded %d, n_past=%d)\n",
+                (long long)(verbose_now_ms() - t_prefill_fwd_start),
+                prefill_remaining, prefill_n_past);
+    }
+
+    // After a successful MISS path (i.e. we actually forwarded the prefix),
+    // capture the leading `cacheable_len` positions of the now-populated KV
+    // cache for next time. Eviction = LRU.
+    if (!cache_hit && prefill_cache_key != 0 && cacheable_len > 0 &&
+        cacheable_len < prefill_len) {
+        prefill_kv_snapshot snap;
+        if (capture_kv_state(cacheable_len, snap)) {
+            // If at capacity, evict the oldest entry first.
+            while (prefill_kv_cache_lru_.size() >= kPrefillKvCacheCapacity &&
+                   !prefill_kv_cache_lru_.empty()) {
+                uint64_t evict = prefill_kv_cache_lru_.front();
+                prefill_kv_cache_lru_.erase(prefill_kv_cache_lru_.begin());
+                prefill_kv_cache_.erase(evict);
+            }
+            // Drop any prior entry under this key (pre-empts a stale snapshot
+            // from before init_kv_cache was re-run with a different n_ctx).
+            auto existing = prefill_kv_cache_.find(prefill_cache_key);
+            if (existing != prefill_kv_cache_.end()) {
+                prefill_kv_cache_.erase(existing);
+                auto lru_it = std::find(prefill_kv_cache_lru_.begin(),
+                                        prefill_kv_cache_lru_.end(),
+                                        prefill_cache_key);
+                if (lru_it != prefill_kv_cache_lru_.end()) {
+                    prefill_kv_cache_lru_.erase(lru_it);
+                }
+            }
+            prefill_kv_cache_.emplace(prefill_cache_key, std::move(snap));
+            prefill_kv_cache_lru_.push_back(prefill_cache_key);
+            if (verbose_) {
+                fprintf(stderr, "  prefill cache STORE (key=%016llx, n_pos=%d, lru_size=%zu)\n",
+                        (unsigned long long) prefill_cache_key, cacheable_len,
+                        prefill_kv_cache_lru_.size());
+            }
+        } else if (verbose_) {
+            fprintf(stderr, "  prefill cache CAPTURE failed: %s\n",
+                    get_error().c_str());
+        }
     }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
