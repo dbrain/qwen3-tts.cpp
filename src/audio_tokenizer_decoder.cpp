@@ -686,15 +686,22 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_residual_block(struct ggml_con
     int64_t out_channels = block.conv1_w->ne[2];
     int padding = 6 * block.dilation;
     x = make_causal_tail(ctx, x, padding, (int) in_channels, tail_name_prefix);
+    // The fused ggml_conv_1d_direct CUDA op exists (see
+    // ggml/src/ggml-cuda/conv-1d-direct.cu) and works correctly, but the
+    // current shared-mem-tiled implementation does not yet beat ggml's
+    // im2col + cuBLAS gemm path on Ampere for these residual-block shapes.
+    // The default ggml_conv_1d path stays the production route until the
+    // direct kernel is tuned (probably needs tensor-core mma + larger tiles
+    // co-designed with the [in_ch, seq] layout). See HANDOFF-perf.md.
     x = ggml_conv_1d(ctx, block.conv1_w, x, 1, 0, block.dilation);
     if (block.conv1_b) {
         x = ggml_add(ctx, x, ggml_reshape_3d(ctx, block.conv1_b, 1, out_channels, 1));
     }
-    
+
     if (block.act2_alpha) {
         x = apply_snake(ctx, x, block.act2_alpha, block.act2_beta);
     }
-    
+
     out_channels = block.conv2_w->ne[2];
     x = ggml_conv_1d(ctx, block.conv2_w, x, 1, 0, 1);
     if (block.conv2_b) {
