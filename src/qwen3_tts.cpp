@@ -917,6 +917,31 @@ void Qwen3TTS::clear_icl_cache() {
     icl_cache_.clear();
 }
 
+void Qwen3TTS::unload_model() {
+    // Release in reverse-of-likely-dependency order. Each component's
+    // unload_model() is idempotent (no-op if already unloaded).
+    audio_decoder_.unload_model();
+    codec_encoder_.unload_model();
+    audio_encoder_.unload_model();
+    transformer_.unload_model();
+
+    encoder_loaded_       = false;
+    codec_encoder_loaded_ = false;
+    transformer_loaded_   = false;
+    decoder_loaded_       = false;
+    models_loaded_        = false;
+}
+
+bool Qwen3TTS::reload_model() {
+    if (models_loaded_) return true;
+    if (tts_model_path_.empty()) {
+        error_msg_ = "reload_model(): no prior load_model_files() to reload from";
+        return false;
+    }
+    return load_model_files(tts_model_path_, decoder_model_path_,
+                            speaker_encoder_model_path_);
+}
+
 void Qwen3TTS::set_progress_callback(tts_progress_callback_t callback) {
     progress_callback_ = callback;
 }

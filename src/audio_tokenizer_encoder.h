@@ -100,7 +100,10 @@ public:
     
     // Load model from GGUF file (main TTS model, not tokenizer)
     bool load_model(const std::string & model_path);
-    
+
+    // Release all backend / sched / model buffers. Idempotent.
+    void unload_model();
+
     // Encode audio samples to speaker embedding
     // samples: audio samples normalized to [-1, 1], 24kHz
     // n_samples: number of samples

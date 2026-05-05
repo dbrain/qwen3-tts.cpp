@@ -218,6 +218,19 @@ public:
     // change that would invalidate cached state (e.g. vocoder model swap).
     void clear_icl_cache();
 
+    // Release all model GPU/CPU buffers, schedulers, and backends. After
+    // this call, is_loaded() returns false until reload_model() (or
+    // load_model_files()) is called. Synthesis attempts will fail until
+    // the model is reloaded. Host-side caches (icl_cache_, voices map in
+    // server.cpp) are NOT cleared — they remain valid across unload/reload
+    // of the same model.
+    void unload_model();
+
+    // Reload the model files using paths captured by the most recent
+    // load_model_files() / load_models() call. Cheap no-op if already
+    // loaded. Returns false (with get_error()) on failure.
+    bool reload_model();
+
 private:
     tts_result synthesize_internal(const std::string & text,
                                    const float * speaker_embedding,

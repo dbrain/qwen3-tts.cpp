@@ -590,8 +590,38 @@ int main(int argc, char ** argv) {
     });
 
     // --- GET /health ---
-    svr.Get("/health", [](const httplib::Request &, httplib::Response & res) {
-        res.set_content(R"({"status":"ok"})", "application/json");
+    svr.Get("/health", [&tts](const httplib::Request &, httplib::Response & res) {
+        json health = {{"status", "ok"}, {"model_loaded", tts.is_loaded()}};
+        res.set_content(health.dump(), "application/json");
+    });
+
+    // --- POST /v1/admin/unload --- release model GPU/CPU buffers in-process.
+    // For VRAM management when other workloads need the GPU. Idempotent.
+    svr.Post("/v1/admin/unload",
+        [&tts, &synth_mutex](const httplib::Request &, httplib::Response & res) {
+        std::lock_guard<std::mutex> lock(synth_mutex);
+        const bool was_loaded = tts.is_loaded();
+        if (was_loaded) tts.unload_model();
+        json out = {{"unloaded", was_loaded}, {"model_loaded", tts.is_loaded()}};
+        res.set_content(out.dump(), "application/json");
+    });
+
+    // --- POST /v1/admin/load --- reload model files using paths captured
+    // by the prior load. No-op if already loaded.
+    svr.Post("/v1/admin/load",
+        [&tts, &synth_mutex](const httplib::Request &, httplib::Response & res) {
+        std::lock_guard<std::mutex> lock(synth_mutex);
+        const bool was_loaded = tts.is_loaded();
+        bool ok = was_loaded || tts.reload_model();
+        if (!ok) {
+            res.status = 500;
+            json err = {{"error", {{"message", "reload_model failed: " + tts.get_error()},
+                                    {"type", "server_error"}}}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        json out = {{"loaded", !was_loaded}, {"model_loaded", tts.is_loaded()}};
+        res.set_content(out.dump(), "application/json");
     });
 
     // --- GET /v1/models ---
