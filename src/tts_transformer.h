@@ -325,6 +325,25 @@ public:
 
     // Drop all cached prefill KV snapshots. Called by Qwen3TTS::unload_model.
     void clear_prefill_kv_cache();
+
+    // -- Persistence helpers (used by Qwen3TTS::save/load_voice_warmup) ---
+
+    // Read-only access to a cached entry, if present. Returns nullptr when
+    // missing. Caller must NOT mutate or persist the pointer past the
+    // next call that could trigger eviction.
+    const prefill_kv_snapshot * get_prefill_kv_snapshot(uint64_t key) const;
+
+    // Insert a snapshot into the cache (overwrites any existing entry under
+    // the same key, refreshes LRU position). Used at startup when the server
+    // imports a previously-saved voice warmup blob.
+    void put_prefill_kv_snapshot(uint64_t key, prefill_kv_snapshot snap);
+
+    // Read-only access to the cached icl_codec_section bytes for a voice
+    // (keyed by ref_codes hash). Returns nullptr if not cached.
+    const std::vector<float> * get_icl_codec_section(uint64_t ref_codes_hash) const;
+
+    // Insert icl_codec_section bytes into the cache.
+    void put_icl_codec_section(uint64_t ref_codes_hash, std::vector<float> data);
     
     const tts_transformer_config & get_config() const { return model_.config; }
 

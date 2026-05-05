@@ -920,6 +920,40 @@ void TTSTransformer::clear_prefill_kv_cache() {
     icl_codec_section_cache_.clear();
 }
 
+const TTSTransformer::prefill_kv_snapshot *
+TTSTransformer::get_prefill_kv_snapshot(uint64_t key) const {
+    auto it = prefill_kv_cache_.find(key);
+    return it == prefill_kv_cache_.end() ? nullptr : &it->second;
+}
+
+void TTSTransformer::put_prefill_kv_snapshot(uint64_t key, prefill_kv_snapshot snap) {
+    // Remove any existing LRU entry under this key, then re-insert at MRU.
+    auto lru_it = std::find(prefill_kv_cache_lru_.begin(),
+                            prefill_kv_cache_lru_.end(), key);
+    if (lru_it != prefill_kv_cache_lru_.end()) {
+        prefill_kv_cache_lru_.erase(lru_it);
+    }
+    while (prefill_kv_cache_lru_.size() >= kPrefillKvCacheCapacity &&
+           !prefill_kv_cache_lru_.empty()) {
+        uint64_t evict = prefill_kv_cache_lru_.front();
+        prefill_kv_cache_lru_.erase(prefill_kv_cache_lru_.begin());
+        prefill_kv_cache_.erase(evict);
+    }
+    prefill_kv_cache_[key] = std::move(snap);
+    prefill_kv_cache_lru_.push_back(key);
+}
+
+const std::vector<float> *
+TTSTransformer::get_icl_codec_section(uint64_t ref_codes_hash) const {
+    auto it = icl_codec_section_cache_.find(ref_codes_hash);
+    return it == icl_codec_section_cache_.end() ? nullptr : &it->second;
+}
+
+void TTSTransformer::put_icl_codec_section(uint64_t ref_codes_hash,
+                                            std::vector<float> data) {
+    icl_codec_section_cache_[ref_codes_hash] = std::move(data);
+}
+
 bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
     const auto & cfg = model_.config;
     

@@ -90,7 +90,13 @@ struct tts_result {
     uint64_t mem_phys_start_bytes = 0;
     uint64_t mem_phys_end_bytes = 0;
     uint64_t mem_phys_peak_bytes = 0;
-    
+
+    // Cache keys this synth used. Both are 0 for non-cacheable synths
+    // (e.g. raw-audio path with a per-call speaker embedding). The
+    // server uses these to persist the now-populated caches alongside
+    // the voice bundle. See save_voice_warmup.
+    uint64_t prefill_cache_key = 0;
+    uint64_t ref_codes_hash    = 0;
 };
 
 // Progress callback type
@@ -227,6 +233,35 @@ public:
     // Saves ~250 MiB of permanently-resident VRAM after the first
     // register call.
     void unload_encoders();
+
+    // -- Persistent voice caches (cold-path elimination) ------------------
+    //
+    // After a successful synth, three host-side caches are populated for
+    // the voice: talker prefill KV snapshot, icl_codec_section embedding
+    // bytes, and vocoder ICL warmup state. Together these eliminate
+    // ~700 ms of cold-path TTFA on Q4 voice_clone. Persisting them to
+    // disk lets a server that frequently unloads/reloads (e.g. shared
+    // GPU) skip the cold-path tax across restarts.
+    //
+    // Lifecycle: server calls save_voice_warmup(voice_id, <keys>, path)
+    // after first successful synth for the voice, and load_voice_warmup
+    // on startup before the model serves traffic. Format is self-describing;
+    // load is best-effort — wrong model_id, version, or shape returns
+    // false silently and the next synth rebuilds the caches.
+    bool save_voice_warmup(const std::string & voice_id,
+                           uint64_t prefill_cache_key,
+                           uint64_t ref_codes_hash,
+                           const std::string & path,
+                           const std::string & model_id);
+
+    // Load previously-saved voice warmup state for the given path. The
+    // file's stored prefill_cache_key + ref_codes_hash become the keys
+    // under which the in-memory caches are seeded — subsequent synths
+    // that produce matching keys (deterministic from the same inputs)
+    // hit the cache without rebuilding. Returns true if at least one
+    // section was loaded; missing/stale/mismatched files return false.
+    bool load_voice_warmup(const std::string & path,
+                           const std::string & model_id);
 
     // Release all model GPU/CPU buffers, schedulers, and backends. After
     // this call, is_loaded() returns false until reload_model() (or

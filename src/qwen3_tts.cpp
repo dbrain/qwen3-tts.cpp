@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <type_traits>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -609,11 +610,21 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         // ref_codes byte stream and restore on subsequent hits — saves
         // ~700-1200 ms TTFA on every cloned-voice synth.
         if (ref_codes && n_ref_frames > 0 && !params.ref_text.empty()) {
+            // Hash matches build_prefill_graph's icl_codec_section_cache_ key
+            // and result.ref_codes_hash exactly so all three caches keyed by
+            // ref_codes content share one consistent identifier — important
+            // for the persistent voice.warmup blob to round-trip correctly.
             const size_t n_bytes = (size_t) n_ref_frames * n_cb * sizeof(int32_t);
             uint64_t hash = 1469598103934665603ull; // FNV-1a 64 offset basis
             const uint8_t * p = reinterpret_cast<const uint8_t *>(ref_codes);
             for (size_t i = 0; i < n_bytes; ++i) {
                 hash ^= p[i];
+                hash *= 1099511628211ull;
+            }
+            int32_t mix[2] = { n_ref_frames, n_cb };
+            const uint8_t * mp = reinterpret_cast<const uint8_t *>(mix);
+            for (size_t i = 0; i < sizeof(mix); ++i) {
+                hash ^= mp[i];
                 hash *= 1099511628211ull;
             }
 
@@ -707,6 +718,22 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
         prefill_cache_key = h;
         if (prefill_cache_key == 0) prefill_cache_key = 1; // 0 reserved for "no cache"
+    }
+    result.prefill_cache_key = prefill_cache_key;
+
+    // Also compute the ref_codes_hash that build_prefill_graph and the ICL
+    // warmup path key into. Server uses both keys to drive disk persistence
+    // of the now-populated caches via save_voice_warmup.
+    if (ref_codes && n_ref_frames > 0) {
+        const int32_t n_cb_for_hash = transformer_.get_config().n_codebooks;
+        const size_t n_bytes = (size_t) n_ref_frames * n_cb_for_hash * sizeof(int32_t);
+        uint64_t h = 1469598103934665603ull;
+        const uint8_t * p = reinterpret_cast<const uint8_t *>(ref_codes);
+        for (size_t i = 0; i < n_bytes; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+        int32_t mix[2] = { n_ref_frames, n_cb_for_hash };
+        const uint8_t * mp = reinterpret_cast<const uint8_t *>(mix);
+        for (size_t i = 0; i < sizeof(mix); ++i) { h ^= mp[i]; h *= 1099511628211ull; }
+        result.ref_codes_hash = h;
     }
 
     std::vector<int32_t> speech_codes;
@@ -963,6 +990,353 @@ void Qwen3TTS::unload_encoders() {
         codec_encoder_.unload_model();
         codec_encoder_loaded_ = false;
     }
+}
+
+// -- Persistent voice caches ------------------------------------------------
+//
+// File layout:
+//   header:
+//     magic[8] = "QW3WARM\0"
+//     u32 version (=1)
+//     u32 model_id_len
+//     model_id bytes
+//     u64 prefill_cache_key      (matches at load time)
+//     u64 ref_codes_hash         (matches at load time)
+//   then a sequence of sections, each:
+//     u32 section_id
+//     u32 section_payload_size
+//     section_payload bytes
+//   sections are skip-tolerant; unknown ids are passed over.
+//
+// Sections (id):
+//   1 prefill_kv_snapshot     n_pos, n_layers, layer_bytes,
+//                             then K, V byte runs interleaved per layer.
+//   2 icl_codec_section       n_floats, raw f32 little-endian bytes.
+//   3 vocoder_icl_warmup      n_past, then four maps/vectors of float
+//                             buffers (tail rings, conv_t overlaps,
+//                             past_k hosts, past_v hosts).
+//
+// Format is intentionally simple: a malformed or quant-mismatched file
+// is rejected wholesale at load time and the next synth rebuilds the
+// in-memory caches from scratch.
+
+namespace {
+
+constexpr char     kWarmupMagic[8] = {'Q','W','3','W','A','R','M','\0'};
+constexpr uint32_t kWarmupVersion  = 1;
+
+constexpr uint32_t kSectionPrefillKv      = 1;
+constexpr uint32_t kSectionIclCodec       = 2;
+constexpr uint32_t kSectionVocoderWarmup  = 3;
+
+template <typename T>
+void blob_write(std::vector<uint8_t> & out, const T & v) {
+    static_assert(std::is_trivially_copyable<T>::value, "POD only");
+    const uint8_t * p = reinterpret_cast<const uint8_t *>(&v);
+    out.insert(out.end(), p, p + sizeof(T));
+}
+
+void blob_write_bytes(std::vector<uint8_t> & out, const void * p, size_t n) {
+    const uint8_t * b = static_cast<const uint8_t *>(p);
+    out.insert(out.end(), b, b + n);
+}
+
+template <typename T>
+bool blob_read(const std::vector<uint8_t> & in, size_t & pos, T & v) {
+    if (pos + sizeof(T) > in.size()) return false;
+    std::memcpy(&v, in.data() + pos, sizeof(T));
+    pos += sizeof(T);
+    return true;
+}
+
+bool blob_read_bytes(const std::vector<uint8_t> & in, size_t & pos,
+                     void * out, size_t n) {
+    if (pos + n > in.size()) return false;
+    std::memcpy(out, in.data() + pos, n);
+    pos += n;
+    return true;
+}
+
+void serialize_float_vec(std::vector<uint8_t> & out, const std::vector<float> & v) {
+    const uint32_t n = (uint32_t) v.size();
+    blob_write(out, n);
+    if (n) blob_write_bytes(out, v.data(), n * sizeof(float));
+}
+
+bool deserialize_float_vec(const std::vector<uint8_t> & in, size_t & pos,
+                            std::vector<float> & out) {
+    uint32_t n = 0;
+    if (!blob_read(in, pos, n)) return false;
+    out.resize(n);
+    if (n) {
+        if (!blob_read_bytes(in, pos, out.data(), n * sizeof(float))) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool Qwen3TTS::save_voice_warmup(const std::string & voice_id,
+                                  uint64_t prefill_cache_key,
+                                  uint64_t ref_codes_hash,
+                                  const std::string & path,
+                                  const std::string & model_id) {
+    std::vector<uint8_t> blob;
+    blob.reserve(8 * 1024 * 1024);
+
+    blob_write_bytes(blob, kWarmupMagic, sizeof(kWarmupMagic));
+    blob_write(blob, kWarmupVersion);
+    const uint32_t mid_len = (uint32_t) model_id.size();
+    blob_write(blob, mid_len);
+    if (mid_len) blob_write_bytes(blob, model_id.data(), mid_len);
+    blob_write(blob, prefill_cache_key);
+    blob_write(blob, ref_codes_hash);
+
+    int sections_written = 0;
+
+    // Section 1: prefill KV snapshot.
+    if (auto * snap = transformer_.get_prefill_kv_snapshot(prefill_cache_key)) {
+        std::vector<uint8_t> payload;
+        const int32_t n_pos     = snap->n_pos;
+        const int32_t n_layers  = (int32_t) snap->k_layers.size();
+        const uint32_t layer_bytes = snap->k_layers.empty()
+            ? 0u
+            : (uint32_t) snap->k_layers[0].size();
+        blob_write(payload, n_pos);
+        blob_write(payload, n_layers);
+        blob_write(payload, layer_bytes);
+        for (int il = 0; il < n_layers; ++il) {
+            if (snap->k_layers[il].size() != layer_bytes ||
+                snap->v_layers[il].size() != layer_bytes) {
+                error_msg_ = "save_voice_warmup: layer byte size mismatch";
+                return false;
+            }
+            blob_write_bytes(payload, snap->k_layers[il].data(), layer_bytes);
+            blob_write_bytes(payload, snap->v_layers[il].data(), layer_bytes);
+        }
+        const uint32_t section_id   = kSectionPrefillKv;
+        const uint32_t payload_size = (uint32_t) payload.size();
+        blob_write(blob, section_id);
+        blob_write(blob, payload_size);
+        blob_write_bytes(blob, payload.data(), payload.size());
+        ++sections_written;
+    }
+
+    // Section 2: icl_codec_section.
+    if (auto * sect = transformer_.get_icl_codec_section(ref_codes_hash)) {
+        std::vector<uint8_t> payload;
+        serialize_float_vec(payload, *sect);
+        const uint32_t section_id   = kSectionIclCodec;
+        const uint32_t payload_size = (uint32_t) payload.size();
+        blob_write(blob, section_id);
+        blob_write(blob, payload_size);
+        blob_write_bytes(blob, payload.data(), payload.size());
+        ++sections_written;
+    }
+
+    // Section 3: vocoder ICL warmup state.
+    auto vit = icl_cache_.find(ref_codes_hash);
+    if (vit != icl_cache_.end()) {
+        const auto & snap = vit->second;
+        std::vector<uint8_t> payload;
+        blob_write(payload, snap.n_past);
+        // tail_rings (map<string, vector<float>>)
+        const uint32_t n_tails = (uint32_t) snap.tail_rings.size();
+        blob_write(payload, n_tails);
+        for (const auto & kv : snap.tail_rings) {
+            const uint32_t name_len = (uint32_t) kv.first.size();
+            blob_write(payload, name_len);
+            if (name_len) blob_write_bytes(payload, kv.first.data(), name_len);
+            serialize_float_vec(payload, kv.second);
+        }
+        // conv_t_overlap_hosts
+        const uint32_t n_ct = (uint32_t) snap.conv_t_overlap_hosts.size();
+        blob_write(payload, n_ct);
+        for (const auto & kv : snap.conv_t_overlap_hosts) {
+            const uint32_t name_len = (uint32_t) kv.first.size();
+            blob_write(payload, name_len);
+            if (name_len) blob_write_bytes(payload, kv.first.data(), name_len);
+            serialize_float_vec(payload, kv.second);
+        }
+        // past_k_hosts (vector<vector<float>>)
+        const uint32_t n_pk = (uint32_t) snap.past_k_hosts.size();
+        blob_write(payload, n_pk);
+        for (const auto & v : snap.past_k_hosts) serialize_float_vec(payload, v);
+        const uint32_t n_pv = (uint32_t) snap.past_v_hosts.size();
+        blob_write(payload, n_pv);
+        for (const auto & v : snap.past_v_hosts) serialize_float_vec(payload, v);
+
+        const uint32_t section_id   = kSectionVocoderWarmup;
+        const uint32_t payload_size = (uint32_t) payload.size();
+        blob_write(blob, section_id);
+        blob_write(blob, payload_size);
+        blob_write_bytes(blob, payload.data(), payload.size());
+        ++sections_written;
+    }
+
+    if (sections_written == 0) {
+        // Nothing cached for this voice yet — don't write an empty file.
+        return false;
+    }
+
+    // Atomic write via tmp + rename.
+    const std::string tmp = path + ".tmp";
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        error_msg_ = "save_voice_warmup: failed to open " + tmp;
+        return false;
+    }
+    f.write(reinterpret_cast<const char *>(blob.data()), (std::streamsize) blob.size());
+    f.close();
+    if (!f) {
+        error_msg_ = "save_voice_warmup: write failed for " + tmp;
+        std::remove(tmp.c_str());
+        return false;
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        error_msg_ = "save_voice_warmup: rename failed for " + tmp;
+        std::remove(tmp.c_str());
+        return false;
+    }
+    fprintf(stderr, "  voice-warmup: saved '%s' (%d sections, %.1f KB) → %s\n",
+            voice_id.c_str(), sections_written,
+            blob.size() / 1024.0, path.c_str());
+    return true;
+}
+
+bool Qwen3TTS::load_voice_warmup(const std::string & path,
+                                  const std::string & model_id) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        // missing file is a normal "no warmup yet" signal — don't error.
+        return false;
+    }
+    const auto sz = f.tellg();
+    if (sz <= 0) return false;
+    std::vector<uint8_t> blob((size_t) sz);
+    f.seekg(0);
+    f.read(reinterpret_cast<char *>(blob.data()), (std::streamsize) sz);
+    if (!f) {
+        error_msg_ = "load_voice_warmup: short read on " + path;
+        return false;
+    }
+
+    size_t pos = 0;
+    char magic_in[8];
+    if (!blob_read_bytes(blob, pos, magic_in, sizeof(magic_in))) return false;
+    if (std::memcmp(magic_in, kWarmupMagic, sizeof(kWarmupMagic)) != 0) {
+        return false;
+    }
+    uint32_t version = 0;
+    if (!blob_read(blob, pos, version)) return false;
+    if (version != kWarmupVersion) return false;
+
+    uint32_t mid_len = 0;
+    if (!blob_read(blob, pos, mid_len)) return false;
+    if (mid_len > 1024) return false;
+    std::string saved_model_id(mid_len, '\0');
+    if (mid_len) {
+        if (!blob_read_bytes(blob, pos, saved_model_id.data(), mid_len)) return false;
+    }
+    if (saved_model_id != model_id) {
+        // quant or model swap → silently ignore
+        return false;
+    }
+
+    uint64_t prefill_cache_key = 0, ref_codes_hash = 0;
+    if (!blob_read(blob, pos, prefill_cache_key)) return false;
+    if (!blob_read(blob, pos, ref_codes_hash))    return false;
+
+    int sections_loaded = 0;
+    while (pos < blob.size()) {
+        uint32_t section_id = 0, payload_size = 0;
+        if (!blob_read(blob, pos, section_id)) break;
+        if (!blob_read(blob, pos, payload_size)) break;
+        if (pos + payload_size > blob.size()) break;
+        const size_t section_end = pos + payload_size;
+
+        if (section_id == kSectionPrefillKv) {
+            int32_t n_pos = 0, n_layers = 0;
+            uint32_t layer_bytes = 0;
+            if (!blob_read(blob, pos, n_pos))     { pos = section_end; continue; }
+            if (!blob_read(blob, pos, n_layers))  { pos = section_end; continue; }
+            if (!blob_read(blob, pos, layer_bytes)) { pos = section_end; continue; }
+            if (n_pos <= 0 || n_layers <= 0 || layer_bytes == 0) {
+                pos = section_end; continue;
+            }
+            TTSTransformer::prefill_kv_snapshot snap;
+            snap.n_pos = n_pos;
+            snap.k_layers.resize(n_layers);
+            snap.v_layers.resize(n_layers);
+            bool ok = true;
+            for (int il = 0; il < n_layers && ok; ++il) {
+                snap.k_layers[il].resize(layer_bytes);
+                snap.v_layers[il].resize(layer_bytes);
+                if (!blob_read_bytes(blob, pos, snap.k_layers[il].data(), layer_bytes)) ok = false;
+                if (ok && !blob_read_bytes(blob, pos, snap.v_layers[il].data(), layer_bytes)) ok = false;
+            }
+            if (ok) {
+                transformer_.put_prefill_kv_snapshot(prefill_cache_key, std::move(snap));
+                ++sections_loaded;
+            }
+            pos = section_end;
+        } else if (section_id == kSectionIclCodec) {
+            std::vector<float> v;
+            if (deserialize_float_vec(blob, pos, v)) {
+                transformer_.put_icl_codec_section(ref_codes_hash, std::move(v));
+                ++sections_loaded;
+            }
+            pos = section_end;
+        } else if (section_id == kSectionVocoderWarmup) {
+            AudioTokenizerDecoder::stream_state_snapshot snap;
+            bool ok = blob_read(blob, pos, snap.n_past);
+            uint32_t n_tails = 0, n_ct = 0, n_pk = 0, n_pv = 0;
+            if (ok) ok = blob_read(blob, pos, n_tails);
+            for (uint32_t i = 0; i < n_tails && ok; ++i) {
+                uint32_t name_len = 0;
+                if (!blob_read(blob, pos, name_len)) { ok = false; break; }
+                std::string name(name_len, '\0');
+                if (name_len && !blob_read_bytes(blob, pos, name.data(), name_len)) { ok = false; break; }
+                std::vector<float> v;
+                if (!deserialize_float_vec(blob, pos, v)) { ok = false; break; }
+                snap.tail_rings.emplace(std::move(name), std::move(v));
+            }
+            if (ok) ok = blob_read(blob, pos, n_ct);
+            for (uint32_t i = 0; i < n_ct && ok; ++i) {
+                uint32_t name_len = 0;
+                if (!blob_read(blob, pos, name_len)) { ok = false; break; }
+                std::string name(name_len, '\0');
+                if (name_len && !blob_read_bytes(blob, pos, name.data(), name_len)) { ok = false; break; }
+                std::vector<float> v;
+                if (!deserialize_float_vec(blob, pos, v)) { ok = false; break; }
+                snap.conv_t_overlap_hosts.emplace(std::move(name), std::move(v));
+            }
+            if (ok) ok = blob_read(blob, pos, n_pk);
+            for (uint32_t i = 0; i < n_pk && ok; ++i) {
+                std::vector<float> v;
+                if (!deserialize_float_vec(blob, pos, v)) { ok = false; break; }
+                snap.past_k_hosts.push_back(std::move(v));
+            }
+            if (ok) ok = blob_read(blob, pos, n_pv);
+            for (uint32_t i = 0; i < n_pv && ok; ++i) {
+                std::vector<float> v;
+                if (!deserialize_float_vec(blob, pos, v)) { ok = false; break; }
+                snap.past_v_hosts.push_back(std::move(v));
+            }
+            if (ok) {
+                icl_cache_.emplace(ref_codes_hash, std::move(snap));
+                ++sections_loaded;
+            }
+            pos = section_end;
+        } else {
+            // unknown section — skip
+            pos = section_end;
+        }
+    }
+    if (sections_loaded == 0) return false;
+    fprintf(stderr, "  voice-warmup: loaded %d sections from %s\n",
+            sections_loaded, path.c_str());
+    return true;
 }
 
 void Qwen3TTS::unload_model() {

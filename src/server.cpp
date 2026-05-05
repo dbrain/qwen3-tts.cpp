@@ -638,6 +638,16 @@ int main(int argc, char ** argv) {
                         name.c_str(), b.has_embedding ? 1 : 0,
                         b.has_codes ? b.n_ref_frames : 0);
                 loaded++;
+
+                // Best-effort: load any persisted prefill / icl_codec /
+                // vocoder ICL warmup state for this voice. Eliminates the
+                // 700-800 ms cold-path TTFA on Q4 voice clones across
+                // server restarts. A missing or stale-tag file is silently
+                // ignored — the next synth rebuilds from scratch.
+                const auto warmup_path = entry.path() / "voice.warmup";
+                if (std::filesystem::exists(warmup_path)) {
+                    tts.load_voice_warmup(warmup_path.string(), model_id);
+                }
             }
             fprintf(stderr, "voice archive: %d loaded, %d deferred\n", loaded, deferred);
         }
@@ -1031,7 +1041,8 @@ int main(int argc, char ** argv) {
 
     // --- POST /v1/audio/speech ---
     svr.Post("/v1/audio/speech",
-        [&tts, &synth_mutex, &sp, &voices, &voices_mutex, &ensure_loaded_locked](const httplib::Request & req, httplib::Response & res) {
+        [&tts, &synth_mutex, &sp, &voices, &voices_mutex,
+         &voice_archive_dir, &model_id, &ensure_loaded_locked](const httplib::Request & req, httplib::Response & res) {
 
         // parse request body
         json body;
@@ -1219,6 +1230,15 @@ int main(int argc, char ** argv) {
         params.instructions       = instructions;
         params.ref_text           = voice_ref_text;
 
+        // Compute path for the voice's persistent warmup blob (cold-path
+        // cache file). Only set when the request is bound to a registered
+        // voice and the voice archive is enabled.
+        std::string warmup_path;
+        if (!voice.empty() && !voice_archive_dir.empty()) {
+            const std::string vd = voice_dir_path(voice_archive_dir, voice);
+            warmup_path = vd + "/voice.warmup";
+        }
+
         // live streaming path: when stream_format is set and stream_batch_size
         // > 0, synthesis runs INSIDE set_chunked_content_provider so PCM
         // batches flush to the wire as they're produced. stream_batch_size=0
@@ -1239,6 +1259,7 @@ int main(int argc, char ** argv) {
                  voice_n_ref_frames,
                  stream_batch_size, stream_first_batch_size, is_sse, is_wav,
                  synth_mutex = &synth_mutex, sample_rate_fallback = 24000,
+                 voice = voice, warmup_path = warmup_path, model_id = model_id,
                  &ensure_loaded_locked]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     std::lock_guard<std::mutex> lock(*synth_mutex);
@@ -1298,6 +1319,18 @@ int main(int argc, char ** argv) {
                         sink.write(done_frame.data(), done_frame.size());
                     }
                     sink.done();
+
+                    // Persist the now-populated voice caches to disk if this
+                    // is the first successful synth for this voice (file
+                    // doesn't already exist). Best-effort — failure here
+                    // can't affect the response that already went out.
+                    if (result.success && !warmup_path.empty() &&
+                        result.prefill_cache_key != 0 &&
+                        !std::filesystem::exists(warmup_path)) {
+                        this_tts->save_voice_warmup(voice,
+                            result.prefill_cache_key, result.ref_codes_hash,
+                            warmup_path, model_id);
+                    }
                     return false;
                 });
             return;
@@ -1346,6 +1379,15 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "synthesized %.2fs audio (%zu samples) in %lldms\n",
                 (float)result.audio.size() / result.sample_rate,
                 result.audio.size(), (long long)result.t_total_ms);
+
+        // Persist the voice's caches to disk on first synth (mirrors the
+        // streaming path). Best-effort, file-existence-guarded so we
+        // don't rewrite the same blob on every subsequent synth.
+        if (!warmup_path.empty() && result.prefill_cache_key != 0 &&
+            !std::filesystem::exists(warmup_path)) {
+            tts.save_voice_warmup(voice, result.prefill_cache_key,
+                                  result.ref_codes_hash, warmup_path, model_id);
+        }
 
         // one-shot (no stream_format): preserve legacy behavior
         if (stream_format.empty()) {
