@@ -620,7 +620,12 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
             (int32_t /*frame_idx*/, const int32_t * frame_codes) -> bool {
                 for (int c = 0; c < n_cb; ++c) stream_buf.push_back(frame_codes[c]);
                 const int frames_buffered = (int) (stream_buf.size() / n_cb);
-                if (frames_buffered >= stream->batch_size) {
+                // First emit can use a smaller batch to minimise TTFB; later
+                // emits use the larger batch_size for throughput.
+                const int target = (stream_cb_count == 0 && stream->first_batch_size > 0)
+                                   ? stream->first_batch_size
+                                   : stream->batch_size;
+                if (frames_buffered >= target) {
                     std::vector<float> pcm;
                     if (!audio_decoder_.stream_decode(stream_buf.data(), frames_buffered, pcm)) {
                         stream_cb_aborted = true;

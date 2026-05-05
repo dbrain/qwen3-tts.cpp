@@ -702,11 +702,14 @@ int main(int argc, char ** argv) {
         int         max_audio_tokens = body.value("max_audio_tokens", 2048);
         float       repetition_penalty = body.value("repetition_penalty", sp.repetition_penalty);
         int64_t     seed               = body.value("seed", sp.seed);
-        int         stream_batch_size  = body.value("stream_batch_size", 0);
+        int         stream_batch_size       = body.value("stream_batch_size", 0);
+        int         stream_first_batch_size = body.value("stream_first_batch_size", 0);
         if (max_audio_tokens < 1) max_audio_tokens = 1;
         if (max_audio_tokens > 8192) max_audio_tokens = 8192;
         if (stream_batch_size < 0) stream_batch_size = 0;
         if (stream_batch_size > 256) stream_batch_size = 256;
+        if (stream_first_batch_size < 0) stream_first_batch_size = 0;
+        if (stream_first_batch_size > 256) stream_first_batch_size = 256;
 
         fprintf(stderr, "request: voice=%s lang=%s fmt=%s temp=%.2f seed=%lld len=%zu\n",
                 voice.empty() ? "default" : voice.c_str(),
@@ -821,7 +824,7 @@ int main(int argc, char ** argv) {
                  voice_embedding = std::move(voice_embedding),
                  voice_ref_codes = std::move(voice_ref_codes),
                  voice_n_ref_frames,
-                 stream_batch_size, is_sse, is_wav,
+                 stream_batch_size, stream_first_batch_size, is_sse, is_wav,
                  synth_mutex = &synth_mutex, sample_rate_fallback = 24000]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     std::lock_guard<std::mutex> lock(*synth_mutex);
@@ -839,6 +842,7 @@ int main(int argc, char ** argv) {
 
                     streaming_opts sopts;
                     sopts.batch_size = stream_batch_size;
+                    sopts.first_batch_size = stream_first_batch_size;
                     sopts.on_pcm = [&](const float * pcm, size_t n) -> bool {
                         ensure_header();
                         std::string bytes = encode_pcm(std::vector<float>(pcm, pcm + n));

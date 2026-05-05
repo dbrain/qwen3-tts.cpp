@@ -104,6 +104,10 @@ using tts_progress_callback_t = std::function<void(int tokens_generated, int max
 // bytes can ignore it.
 struct streaming_opts {
     int32_t batch_size = 0;
+    // Batch size for the FIRST emit only. If 0, falls back to batch_size.
+    // Set to a small value (e.g. 1-5) to minimise time-to-first-byte while
+    // letting subsequent batches stay large enough to keep throughput up.
+    int32_t first_batch_size = 0;
     std::function<bool(const float * pcm, size_t n_samples)> on_pcm;
 };
 
