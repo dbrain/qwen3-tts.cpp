@@ -22,17 +22,22 @@
 >
 > Probably a "never upstream change" - I'm sure as hell not creating a PR for (likely horrible) code I may never bother to understand properly. Potentially a "Only works on my hardware". Basically "Here be dragons" - but pretty dragons that turned my frown upside down because I can use this TTS now and its quick.
 
-This fork ([dbrain/qwen3-tts.cpp](https://github.com/dbrain/qwen3-tts.cpp), paired with [dbrain/ggml](https://github.com/dbrain/ggml)) layers the following on top of [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp). Headline number on a single RTX 3060 / 12 GB / Ampere: **~2.78× realtime** on Q8_0 (i.e. ~2.78 s of 24 kHz audio per wall-second), measured across the bench suite at peak ~3.35 GB VRAM. Compared to upstream PyTorch + transformers on the same model (BF16), that's roughly **+50 %** end-to-end at single-stream decode.
+This fork ([dbrain/qwen3-tts.cpp](https://github.com/dbrain/qwen3-tts.cpp), paired with [dbrain/ggml](https://github.com/dbrain/ggml)) layers the following on top of [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp). Headline numbers on a single RTX 3060 / 12 GB / Ampere, Q8_0 talker, V1 24 kHz vocoder: **~3.4× realtime** (i.e. ~3.4 s of 24 kHz audio per wall-second of compute), default-budget paragraph **~3.05 GB peak VRAM**, max-budget cap-out (`max_audio_tokens=8192`) **~3.45 GB peak**. Compared to upstream PyTorch + transformers on the same model (BF16), that's roughly **+80 %** end-to-end at single-stream decode while sitting under 4 GB.
 
 ### Performance
 
-- **wmma `conv_1d_direct` kernel** in dbrain/ggml — single biggest fork-arc jump (RTF 1.87 → 2.61). Tensor-core `nvcuda::wmma` GEMM with on-the-fly im2col index calculation, replacing the im2col-temp + cuBLAS path. **F16 weights only** (vocoder cascade — do not quantise the vocoder beyond F16, that drops the kernel).
-- **Fused `GGML_OP_SNAKE` op** (CPU + CUDA) — replaces the `pow(sin(αx), 2) / α + β·x` broadcast chain used at every vocoder residual. Removes a ~10× tensor-broadcast overhead and a `powf` NaN edge case.
+- **wmma `conv_1d_direct` and `conv_transpose_1d` kernels** in dbrain/ggml — single biggest fork-arc jump (RTF 1.87 → 2.61 on conv_1d_direct, then 2.65 → 3.37 once the smem-tiled F16 `conv_transpose_1d` landed). Tensor-core `nvcuda::wmma` GEMM with on-the-fly im2col index calculation, replacing the im2col-temp + cuBLAS path. **F16 weights only** (vocoder cascade — do not quantise the vocoder beyond F16, that drops the kernel).
+- **F16 cascade activations** — every cascade intermediate (4-5 dec_blocks × `conv_transpose_1d` + 3 residuals each) runs F16 instead of F32. The wmma accumulator and snake math stay F32 internally, only dst writes truncate. Halves the scheduler arena: vocoder `sched_cu` 144 → 94 MiB at chunk=30. `QWEN3_TTS_VOCODER_FP16_CASCADE=0` reverts.
+- **Streaming batch=30 default** — `--streaming-batch-size 30`, `--streaming-first-batch-size 1`. Cuts cascade buffer size linearly vs the prior batch=60 default (each cascade intermediate is `batch × stride^cascade × channels`), saving another 144 MiB sched_cu at noise-level RTF cost. TTFB unchanged because `first_batch_size=1` is independent of steady-state batch. Per-request body wins; envs `QWEN3_TTS_DEFAULT_STREAM_*` override.
+- **Chunked ICL warmup** — the voice-clone warmup decode used to feed the entire `n_ref_frames`-wide ref clip through `stream_decode` in one call, building a single oversized cascade graph that pinned the scheduler arena (e.g. 96-frame ref → 478 MiB sched_cu, frozen for the lifetime of the process). The warmup now chunks at the steady-state batch size, keeping the union flat at 144 MiB on cloned-voice paths.
+- **Persistent GPU streaming KV slab + flash_attn_ext** — replaces the prior per-call `ggml_concat(past, current)` rebuild with one F16 slab written via `ggml_set_rows`, lazily grown in doubling steps to the synth's `max_audio_tokens` budget. Default-budget paragraphs cap at ~64 MiB slab, max-budget at 256 MiB, vs the pre-perf-13 unbounded growth that pushed the CUDA pool past 4 GB on long inputs. `QWEN3_TTS_STREAM_KV_KEEP=1` forces "always keep at high-water"; default shrinks between synths when next budget ≤ ½ current.
 - **Q8_0 KV cache for the talker**, paired with the FA prefill path, default ON. Saves ~64 MiB peak VRAM at no measurable RTFA cost. `QWEN3_TTS_KV_Q8=0` reverts to F16 KV.
+- **Lazy talker KV growth** — initial alloc = `prefill + 1024 + 8`, doubles in 2048-frame steps capped at the synth's `max_audio_tokens + 8`. Default-budget paragraphs sit at ~60 MiB talker KV vs the prior 120 MiB always-alloc-to-cap. `QWEN3_TTS_TALKER_INITIAL_AUDIO=N` overrides.
+- **Fused `GGML_OP_SNAKE` op** (CPU + CUDA, F32/F16 paths) — replaces the `pow(sin(αx), 2) / α + β·x` broadcast chain used at every vocoder residual. Removes a ~10× tensor-broadcast overhead and a `powf` NaN edge case.
 - **Talker prefill K/V view narrowed** to `round_up(n_past + n_tokens, 256)` per call (vs full `n_ctx`). +8 % realtime-speedup, +13 % t/s.
 - **Voice-keyed prefill ICL cache** + per-voice prefill K/V state cache — cold-from-disk TTFA <300 ms.
 - **`max_audio_tokens` env-tunable** (default 2048). Higher values cost linear t/s on every synth via FA's full-`n_ctx` scan; expose so ops can pick.
-- **Streaming defaults baked in**: `--streaming-batch-size 60`, `--streaming-first-batch-size 1`. Bounds vocoder per-call peak and improves TTFA without throughput regression. Per-request body always wins; envs `QWEN3_TTS_DEFAULT_STREAM_*` override defaults.
+- **Q8_0 vocoder mat-mul weights** — load-time quant of pre_tfm attn/FFN/proj + upsample pwconv1/2 + VQ projections. Conv weights stay F16 (wmma kernels demand it). Saves 42 MiB on weights at every budget. `QWEN3_TTS_VOCODER_NO_Q8_LOAD=1` reverts.
 - **CUDA graphs disabled by default** (`GGML_CUDA_DISABLE_GRAPHS=1`) — at batch=1 autoregressive decode they cost +~700 MiB peak with no measurable gain (talker-step cgraph rebuilds every frame, capture's per-key warmup never converges). `=0` to re-enable for workloads where capture pays off.
 
 ### Functionality
@@ -55,7 +60,7 @@ This fork ([dbrain/qwen3-tts.cpp](https://github.com/dbrain/qwen3-tts.cpp), pair
 - **C API** (`qwen3tts_c_api.h`) for bindings into non-C++ hosts.
 - **`/health` endpoint** + bench-friendly timing log (`-V` / `--print-timing`) splitting prefill, decode steps, and vocoder.
 
-### Required GGML kernels (dbrain/ggml@master, 5 commits ahead of upstream)
+### Required GGML kernels (dbrain/ggml@master, 7 commits ahead of upstream)
 
 | Commit | Op |
 |---|---|
@@ -64,27 +69,29 @@ This fork ([dbrain/qwen3-tts.cpp](https://github.com/dbrain/qwen3-tts.cpp), pair
 | `68a08cbf` | Asymmetric padding API for `conv_1d_direct` + `im2col` `gridDim.y` chunking |
 | `963780ac` | Snake powf NaN fix + `conv_1d_direct` early-return sync hazard |
 | `963d6660` | tensor-core `wmma` kernel for `conv_1d_direct` (RTF 1.87 → 2.61) |
+| `86d9a0fc` | smem-tiled F16 wmma `conv_transpose_1d` kernel — vocoder `sched_cpu` 39.6 → 3.6 MiB, RTF 2.65 → 3.37 |
+| `7d41fb0f` | F16 in/out paths through `conv_1d_direct`, `conv_transpose_1d`, `snake`, `acc` + `ggml_*_to` dst-type API variants — keeps the cascade in F16 (sched_cu 144 → 94 MiB at chunk=30) |
 
-The submodule pointer in `.gitmodules` references this fork. From upstream `ggml-org/ggml`, both ops and the wmma kernel are non-mergeable as-is (Qwen3-TTS-specific layouts), so they live in the fork.
+The submodule pointer in `.gitmodules` references this fork. From upstream `ggml-org/ggml`, both ops and the wmma kernels are non-mergeable as-is (Qwen3-TTS-specific layouts), so they live in the fork.
 
 ### A note on "RTF"
 
-This fork (and our up-fork PyTorch reference, [faster-qwen3-tts](https://github.com/qwen-research/faster-qwen3-tts)) reports **RTF as audio-seconds-per-wall-second** (higher is better — 2.78 means we produce ~2.78 s of audio per wall-second of compute). The strict definition (wall / audio, lower is better) is the inverse. We've kept the audio-per-wall convention so numbers compare apples-to-apples with faster-qwen3-tts's bench script.
+This fork (and our up-fork PyTorch reference, [faster-qwen3-tts](https://github.com/qwen-research/faster-qwen3-tts)) reports **RTF as audio-seconds-per-wall-second** (higher is better — 3.4 means we produce ~3.4 s of audio per wall-second of compute). The strict definition (wall / audio, lower is better) is the inverse. We've kept the audio-per-wall convention so numbers compare apples-to-apples with faster-qwen3-tts's bench script.
 
 ### Quant ladder on Ampere (RTX 3060) — single-stream decode
 
 | Quant | RTF (audio/wall) | weights VRAM | Notes |
 |-------|------------------|---------------|-------|
-| Q8_0  | **2.78** | 2316 MiB | fastest — best-tuned MMVQ for batch=1 decode |
-| F16   | 2.15 | ~3400 MiB | slower than Q8 *and* fattest; only use if you want unquantised weights for some external reason |
-| Q4_K_M | 2.11 | 1000 MiB | only useful when VRAM-bound or on pre-Volta GPUs (Q4_K MMQ is slow on cc=86) |
+| Q8_0  | **3.40** | 2316 MiB | fastest — best-tuned MMVQ for batch=1 decode, default |
+| Q4_K_M | 2.45 | 1000 MiB | only useful when VRAM-bound or on pre-Volta GPUs (Q4_K MMQ is slow on cc=86) |
+| F16   | 2.20 | ~3400 MiB | slower than Q8 *and* fattest; only use if you want unquantised weights for some external reason |
 
 Don't promote F16 or Q4_K_M to default on Ampere. Q8_0 is the sweet spot.
 
 ### Current limitations
 
-- **Vocoder VRAM is fatter than ideal**: 5 of the vocoder's `conv_transpose_1d` ops fall back to CPU because ggml's CUDA kernel only supports F32 weights and the vocoder uses F16. The CPU fallback eats ~158 MiB scheduler memory plus ~110 MiB CUDA-side staging buffers per call. Output is correct, but per-call vocoder peak is ~250 MiB higher than it has to be. The fix is a smem-tiled F16 `conv_transpose_1d` kernel parallel to the existing `conv_1d_direct` wmma kernel; not yet written.
-- **24 kHz output only**: a 48 kHz "V2" tokenizer ([takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz](https://huggingface.co/takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz)) exists upstream but is not a drop-in: it's a structurally different vocoder (5 decoder blocks instead of 4, codebook_dim 512 instead of 256). Supporting it requires config-driven sizing in `audio_tokenizer_decoder.{h,cpp}` and updates to `convert_tokenizer_to_gguf.py` for V2 tensor names.
+- **CUDA-context floor (~370 MiB)**: ggml's CUDA backend reserves a per-device pool that doesn't shrink mid-process. Below this floor needs a `cudaDeviceReset()` on idle-unload, which would risk re-init safety on the ggml CUDA statics. Not currently attempted.
+- **Vocoder conv weights are F16-only on CUDA**: the wmma `conv_1d_direct` and `conv_transpose_1d` kernels demand F16 weights. Quantising the vocoder beyond F16 (e.g. Q4_K_M conv weights) would drop the wmma path back to im2col + cuBLAS and tank RTF. Per-channel snake α/β stay F32.
 - **Speaker-encoder weights are F16-only**: the ECAPA-TDNN encoder dispatches conv layers through the F16-only `conv_1d_direct` path. F32 weights for the speaker encoder aren't supported, but in practice this isn't a quality limitation — the upstream BF16 weights downcast bit-identically to F16 for ECAPA-TDNN-class encoders, and the bias-add op already requires F32 biases (which is what GGUF stores them as).
 
 ---
