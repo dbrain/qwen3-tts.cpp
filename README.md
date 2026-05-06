@@ -88,6 +88,20 @@ This fork (and our up-fork PyTorch reference, [faster-qwen3-tts](https://github.
 
 Don't promote F16 or Q4_K_M to default on Ampere. Q8_0 is the sweet spot.
 
+### TTFA / streaming latency
+
+Time-to-first-audio is captured by the SSE streaming path (request start → first PCM event). With `streaming-first-batch-size=1` the first emit is a single 12 Hz codec frame, so once prefill + 1 talker step + 1 vocoder decode complete, PCM is on the wire — independent of total synth length.
+
+| Path                                     | Audio length | TTFA       |
+|------------------------------------------|-------------:|-----------:|
+| Default voice / VoiceDesign (no ICL)     |  0.6–21 s    | **35–42 ms** |
+| ICL clone, `voice.warmup` cache HIT      |  5–21 s      | **51–70 ms** |
+| ICL clone, cache MISS (first synth/voice)|  5–6 s       | 384–641 ms |
+
+Hot-path TTFA stays flat across audio length — neither doubles for a 17 s synth nor halves for a 0.6 s one — because only the first codec frame has to be ready before bytes flow. Earlier numbers in the codebase (~220 ms) predate the perf-13 `voice.warmup` snapshot persistence, which lets every cold-from-disk request restore the vocoder ICL state in 5–7 ms instead of re-running the warmup decode.
+
+The ICL cache-MISS path pays the warmup decode once per voice on the first synth in a fresh process, then persists the snapshot to `voice.warmup` on disk so subsequent boots restore from disk in single-digit-ms. The decode itself is chunked at the steady-state streaming batch size, so it doesn't pin the scheduler arena (see "Performance" above).
+
 ### Current limitations
 
 - **CUDA-context floor (~370 MiB)**: ggml's CUDA backend reserves a per-device pool that doesn't shrink mid-process. Below this floor needs a `cudaDeviceReset()` on idle-unload, which would risk re-init safety on the ggml CUDA statics. Not currently attempted.
