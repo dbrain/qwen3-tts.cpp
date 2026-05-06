@@ -1115,7 +1115,11 @@ void Qwen3TTS::unload_encoders() {
 namespace {
 
 constexpr char     kWarmupMagic[8] = {'Q','W','3','W','A','R','M','\0'};
-constexpr uint32_t kWarmupVersion  = 1;
+// v2 (perf-13): vocoder-warmup KV bytes stored as raw uint8 with a dtype
+// tag. v1 stored host-side F32 floats; the runtime now keeps the slab
+// GPU-resident (typically F16) and reads raw bytes back to host. v1 files
+// are rejected silently and the warmup is recomputed on next synth.
+constexpr uint32_t kWarmupVersion  = 2;
 
 constexpr uint32_t kSectionPrefillKv      = 1;
 constexpr uint32_t kSectionIclCodec       = 2;
@@ -1250,13 +1254,24 @@ bool Qwen3TTS::save_voice_warmup(const std::string & voice_id,
             if (name_len) blob_write_bytes(payload, kv.first.data(), name_len);
             serialize_float_vec(payload, kv.second);
         }
-        // past_k_hosts (vector<vector<float>>)
-        const uint32_t n_pk = (uint32_t) snap.past_k_hosts.size();
+        // KV slab dtype + per-layer raw bytes covering [0..n_past).
+        const uint32_t dt_len = (uint32_t) snap.kv_dtype.size();
+        blob_write(payload, dt_len);
+        if (dt_len) blob_write_bytes(payload, snap.kv_dtype.data(), dt_len);
+        const uint32_t n_pk = (uint32_t) snap.past_k_bytes.size();
         blob_write(payload, n_pk);
-        for (const auto & v : snap.past_k_hosts) serialize_float_vec(payload, v);
-        const uint32_t n_pv = (uint32_t) snap.past_v_hosts.size();
+        for (const auto & v : snap.past_k_bytes) {
+            const uint32_t len = (uint32_t) v.size();
+            blob_write(payload, len);
+            if (len) blob_write_bytes(payload, v.data(), len);
+        }
+        const uint32_t n_pv = (uint32_t) snap.past_v_bytes.size();
         blob_write(payload, n_pv);
-        for (const auto & v : snap.past_v_hosts) serialize_float_vec(payload, v);
+        for (const auto & v : snap.past_v_bytes) {
+            const uint32_t len = (uint32_t) v.size();
+            blob_write(payload, len);
+            if (len) blob_write_bytes(payload, v.data(), len);
+        }
 
         const uint32_t section_id   = kSectionVocoderWarmup;
         const uint32_t payload_size = (uint32_t) payload.size();
@@ -1403,17 +1418,27 @@ bool Qwen3TTS::load_voice_warmup(const std::string & path,
                 if (!deserialize_float_vec(blob, pos, v)) { ok = false; break; }
                 snap.conv_t_overlap_hosts.emplace(std::move(name), std::move(v));
             }
+            uint32_t dt_len = 0;
+            if (ok) ok = blob_read(blob, pos, dt_len);
+            if (ok && dt_len) {
+                snap.kv_dtype.assign(dt_len, '\0');
+                if (!blob_read_bytes(blob, pos, snap.kv_dtype.data(), dt_len)) ok = false;
+            }
             if (ok) ok = blob_read(blob, pos, n_pk);
             for (uint32_t i = 0; i < n_pk && ok; ++i) {
-                std::vector<float> v;
-                if (!deserialize_float_vec(blob, pos, v)) { ok = false; break; }
-                snap.past_k_hosts.push_back(std::move(v));
+                uint32_t len = 0;
+                if (!blob_read(blob, pos, len)) { ok = false; break; }
+                std::vector<uint8_t> v(len);
+                if (len && !blob_read_bytes(blob, pos, v.data(), len)) { ok = false; break; }
+                snap.past_k_bytes.push_back(std::move(v));
             }
             if (ok) ok = blob_read(blob, pos, n_pv);
             for (uint32_t i = 0; i < n_pv && ok; ++i) {
-                std::vector<float> v;
-                if (!deserialize_float_vec(blob, pos, v)) { ok = false; break; }
-                snap.past_v_hosts.push_back(std::move(v));
+                uint32_t len = 0;
+                if (!blob_read(blob, pos, len)) { ok = false; break; }
+                std::vector<uint8_t> v(len);
+                if (len && !blob_read_bytes(blob, pos, v.data(), len)) { ok = false; break; }
+                snap.past_v_bytes.push_back(std::move(v));
             }
             if (ok) {
                 icl_cache_.emplace(ref_codes_hash, std::move(snap));

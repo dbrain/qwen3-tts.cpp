@@ -155,12 +155,32 @@ struct audio_decoder_model {
     std::map<std::string, struct ggml_tensor *> tensors;
 };
 
+// Persistent GPU-resident streaming KV cache for the vocoder's pre-transformer
+// self-attention. One slab per layer (K and V separate), allocated once with
+// capacity == max_n_past frames. Per stream_decode call we write the new
+// frames at positions [n_past_..n_past_+n_frames) with ggml_set_rows and
+// attend through a narrowed view [0..n_past_+n_frames). Replaces the prior
+// per-call ggml_concat(past, current) rebuild, which made the per-chunk graph
+// (and therefore the ggml CUDA pool high-water-mark) grow linearly with the
+// audio frames produced.
+struct dec_streaming_kv_cache {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    std::vector<ggml_tensor *> k;   // one per pre_tfm layer, shape (head_dim, n_heads, max_n_past)
+    std::vector<ggml_tensor *> v;
+    int32_t max_n_past = 0;
+    int32_t head_dim   = 0;
+    int32_t n_heads    = 0;
+    int32_t n_layers   = 0;
+};
+
 // Compute state for decoder
 struct audio_decoder_state {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
     std::vector<uint8_t> compute_meta;
+    dec_streaming_kv_cache stream_kv;
 };
 
 // Audio tokenizer decoder (vocoder) class
@@ -204,16 +224,25 @@ public:
     // layer (Qwen3TTS::icl_cache_, keyed by ref_codes hash).
     //
     // Only the persistent fields are captured: n_past_, host tail rings,
-    // conv_transpose overlap buffers, and the per-layer KV host caches.
-    // The transient stream_tails_/stream_conv_ts_/stream_kvs_ vectors are
-    // rebuilt by build_graph() on every stream_decode() call, so they
-    // need not be saved.
+    // conv_transpose overlap buffers, and the per-layer KV slabs (raw
+    // device-format bytes — dtype is opaque to the snapshot).
+    // The transient stream_tails_/stream_conv_ts_ vectors are rebuilt by
+    // build_graph() on every stream_decode() call, so they need not be saved.
     struct stream_state_snapshot {
         int32_t n_past = 0;
         std::map<std::string, std::vector<float>> tail_rings;
         std::map<std::string, std::vector<float>> conv_t_overlap_hosts;
-        std::vector<std::vector<float>> past_k_hosts;
-        std::vector<std::vector<float>> past_v_hosts;
+        // Per-layer raw bytes covering [0..n_past) of the K and V slabs.
+        // Byte layout matches the slab tensor dtype at capture time
+        // (currently F16, configurable via QWEN3_TTS_STREAM_KV_F32). On
+        // restore, the runtime slab dtype must match — otherwise the
+        // snapshot is rejected and the warmup is recomputed.
+        std::vector<std::vector<uint8_t>> past_k_bytes;
+        std::vector<std::vector<uint8_t>> past_v_bytes;
+        // Tag identifying the slab dtype at capture time, e.g. "f16" / "f32".
+        // Empty strings are treated as the legacy F32-float-vector format
+        // (which this snapshot no longer produces but may need to load).
+        std::string kv_dtype;
     };
 
     // Capture current streaming state (typically right after a stream_decode
@@ -261,7 +290,10 @@ private:
     // Apply pre-transformer layer. n_past is the prior KV-cache length
     // (0 in one-shot mode); mask uses n_past as the diagonal offset.
     // layer_idx identifies the layer for streaming KV-cache tensor names.
+    // gf is needed in streaming mode to expand the set_rows nodes that
+    // write Kcur/Vcur into the persistent KV slab.
     struct ggml_tensor * apply_pre_tfm_layer(struct ggml_context * ctx,
+                                              struct ggml_cgraph * gf,
                                               struct ggml_tensor * x,
                                               const pre_tfm_layer & layer,
                                               int32_t n_frames,
@@ -321,7 +353,9 @@ private:
     std::vector<stream_tail> stream_tails_;
 
     // Persistent per-tail host ring buffers, keyed by in_name.
-    // Preserved across calls; cleared by stream_reset().
+    // Preserved across calls; cleared by stream_reset(). The KV portion
+    // of the streaming state moved to state_.stream_kv (GPU-resident slab);
+    // these rings are still host-driven by causal-conv tails and are small.
     std::map<std::string, std::vector<float>> tail_rings_;
 
     // Per-call streaming conv_transpose overlap metadata per decoder block.
@@ -341,18 +375,12 @@ private:
     // Persistent per-block raw-right-tail host buffers, keyed by in_name.
     std::map<std::string, std::vector<float>> conv_t_overlap_hosts_;
 
-    // Per-call streaming KV metadata per attention layer, rebuilt by build_graph.
-    struct stream_kv {
-        std::string past_k_in, past_v_in;
-        std::string next_k_out, next_v_out;
-        struct ggml_tensor * next_k_node = nullptr;
-        struct ggml_tensor * next_v_node = nullptr;
-    };
-    std::vector<stream_kv> stream_kvs_;
-
-    // Persistent per-layer KV host buffers. Size = n_past_ * n_heads * head_dim.
-    std::vector<std::vector<float>> past_k_hosts_;
-    std::vector<std::vector<float>> past_v_hosts_;
+    // Initialise / tear down the persistent streaming KV slab. The first
+    // stream_decode() call after a stream_reset() lazily allocates the slab
+    // sized to QWEN3_TTS_STREAM_KV_MAX_NPAST (default 8192 frames). Reused
+    // across chunks within a synth and across synths if the cap is the same.
+    bool ensure_stream_kv_cache(int32_t max_n_past);
+    void free_stream_kv_cache();
 
     int32_t n_past_ = 0;  // current KV / tail history length
 
