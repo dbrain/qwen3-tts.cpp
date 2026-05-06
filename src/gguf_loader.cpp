@@ -206,36 +206,83 @@ bool load_tensor_data_from_file(
     const size_t data_offset = gguf_get_data_offset(ctx);
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
     std::vector<uint8_t> read_buf;
-    
+    std::vector<float> f32_buf;     // F16 → F32 staging for quant
+    std::vector<uint8_t> quant_buf; // F32 → Q8_0 staging for upload
+
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(ctx, i);
         size_t offset = gguf_get_tensor_offset(ctx, i);
-        
+
         auto it = tensors.find(name);
         if (it == tensors.end()) {
             continue;  // Skip tensors not in our map
         }
-        
+
         struct ggml_tensor * tensor = it->second;
-        size_t nbytes = ggml_nbytes(tensor);
-        
-        read_buf.resize(nbytes);
-        
+        const enum ggml_type src_type = gguf_get_tensor_type(ctx, i);
+        const enum ggml_type dst_type = tensor->type;
+
+        // Source bytes from file are sized by the on-disk type.
+        const int64_t n_elem = ggml_nelements(tensor);
+        size_t src_nbytes;
+        if (src_type == dst_type) {
+            src_nbytes = ggml_nbytes(tensor);
+        } else {
+            // Compute on-disk size from src_type.
+            const size_t blck_size  = (size_t) ggml_blck_size(src_type);
+            const size_t type_size  = ggml_type_size(src_type);
+            src_nbytes = (size_t) n_elem * type_size / blck_size;
+        }
+
+        read_buf.resize(src_nbytes);
+
         if (fseek(f, (long)(data_offset + offset), SEEK_SET) != 0) {
             error_msg = "Failed to seek to tensor data: " + std::string(name);
             fclose(f);
             ggml_backend_free(backend);
             return false;
         }
-        
-        if (fread(read_buf.data(), 1, nbytes, f) != nbytes) {
+
+        if (fread(read_buf.data(), 1, src_nbytes, f) != src_nbytes) {
             error_msg = "Failed to read tensor data: " + std::string(name);
             fclose(f);
             ggml_backend_free(backend);
             return false;
         }
-        
-        ggml_backend_tensor_set(tensor, read_buf.data(), 0, nbytes);
+
+        if (src_type == dst_type) {
+            ggml_backend_tensor_set(tensor, read_buf.data(), 0, src_nbytes);
+        } else if (src_type == GGML_TYPE_F16 && dst_type == GGML_TYPE_Q8_0) {
+            // Decoder requested Q8_0 for selected mat-mul-only weights to
+            // shrink vocoder VRAM (~28 MiB on the V1 12Hz tokenizer). On-disk
+            // is F16; convert F16 → F32 → Q8_0 via tmp buffers, then upload
+            // the quantized payload.
+            f32_buf.resize((size_t) n_elem);
+            ggml_fp16_to_fp32_row(reinterpret_cast<const ggml_fp16_t *>(read_buf.data()),
+                                  f32_buf.data(), n_elem);
+
+            const int64_t n_per_row = tensor->ne[0];
+            const int64_t nrows     = n_elem / n_per_row;
+            const size_t  q_bytes   = ggml_nbytes(tensor);
+            quant_buf.resize(q_bytes);
+            const size_t actual = ggml_quantize_chunk(
+                GGML_TYPE_Q8_0, f32_buf.data(), quant_buf.data(),
+                /*start=*/0, nrows, n_per_row, /*imatrix=*/nullptr);
+            if (actual != q_bytes) {
+                error_msg = "Q8_0 quantize size mismatch for " + std::string(name);
+                fclose(f);
+                ggml_backend_free(backend);
+                return false;
+            }
+            ggml_backend_tensor_set(tensor, quant_buf.data(), 0, q_bytes);
+        } else {
+            error_msg = std::string("Unsupported dtype conversion ") +
+                        ggml_type_name(src_type) + "->" + ggml_type_name(dst_type) +
+                        " for tensor " + name;
+            fclose(f);
+            ggml_backend_free(backend);
+            return false;
+        }
     }
     
     fclose(f);

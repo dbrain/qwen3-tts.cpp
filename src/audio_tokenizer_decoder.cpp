@@ -298,20 +298,70 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
     struct gguf_context * gguf_ctx = loader.get_ctx();
     struct ggml_context * meta_ctx = loader.get_meta_ctx();
     
+    // Q8_0 quantize selected mat-mul-only weights at load time. Conv weights
+    // must stay F16 (wmma kernels demand it). Pre_tfm + upsample point-wise
+    // weights are pure ggml_mul_mat, where ggml-cuda's MMQ path handles Q8_0
+    // directly. Saves ~28 MiB of vocoder weight VRAM on the V1 12Hz tokenizer
+    // (56 MiB pre_tfm blk + 32 MiB upsample pwconv F16 → ~42 MiB at Q8_0).
+    // Set QWEN3_TTS_VOCODER_NO_Q8_LOAD=1 to disable (keep all weights F16).
+    auto should_quantize_q8 = [](const std::string & sname) -> bool {
+        // pre_tfm transformer blocks: attn_q/k/v/output + ffn_gate/up/down.
+        if (sname.find("tok_dec.pre_tfm.blk.") != std::string::npos) {
+            if (sname.find(".attn_q.weight")      != std::string::npos) return true;
+            if (sname.find(".attn_k.weight")      != std::string::npos) return true;
+            if (sname.find(".attn_v.weight")      != std::string::npos) return true;
+            if (sname.find(".attn_output.weight") != std::string::npos) return true;
+            if (sname.find(".ffn_gate.weight")    != std::string::npos) return true;
+            if (sname.find(".ffn_up.weight")      != std::string::npos) return true;
+            if (sname.find(".ffn_down.weight")    != std::string::npos) return true;
+        }
+        // pre_tfm input/output projections (mul_mat).
+        if (sname == "tok_dec.pre_tfm.input_proj.weight")  return true;
+        if (sname == "tok_dec.pre_tfm.output_proj.weight") return true;
+        // Upsample point-wise convs are 1x1 = mul_mat.
+        if (sname.find("tok_dec.upsample.") != std::string::npos &&
+            (sname.find(".pwconv1.weight") != std::string::npos ||
+             sname.find(".pwconv2.weight") != std::string::npos)) {
+            return true;
+        }
+        // VQ projections (mul_mat).
+        if (sname == "tok_dec.vq_first.input_proj.weight")  return true;
+        if (sname == "tok_dec.vq_first.output_proj.weight") return true;
+        if (sname == "tok_dec.vq_rest.input_proj.weight")   return true;
+        if (sname == "tok_dec.vq_rest.output_proj.weight")  return true;
+        return false;
+    };
+
+    const char * env_no_q8 = std::getenv("QWEN3_TTS_VOCODER_NO_Q8_LOAD");
+    const bool quant_disabled = env_no_q8 && env_no_q8[0] == '1';
+    int64_t bytes_saved = 0;
+
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = loader.get_tensor_name(i);
         if (!name || strncmp(name, "tok_dec.", 8) != 0) {
             continue;
         }
-        
 
-        
+
+
         struct ggml_tensor * meta_tensor = ggml_get_tensor(meta_ctx, name);
         if (!meta_tensor) {
             continue;
         }
-        
-        struct ggml_tensor * tensor = ggml_dup_tensor(model_.ctx, meta_tensor);
+
+        struct ggml_tensor * tensor;
+        const std::string sname_for_q8(name);
+        const bool quant = !quant_disabled
+            && meta_tensor->type == GGML_TYPE_F16
+            && (meta_tensor->ne[0] % 32) == 0
+            && should_quantize_q8(sname_for_q8);
+        if (quant) {
+            const int n_dims = ggml_n_dims(meta_tensor);
+            tensor = ggml_new_tensor(model_.ctx, GGML_TYPE_Q8_0, n_dims, meta_tensor->ne);
+            bytes_saved += (int64_t) ggml_nbytes(meta_tensor) - (int64_t) ggml_nbytes(tensor);
+        } else {
+            tensor = ggml_dup_tensor(model_.ctx, meta_tensor);
+        }
         ggml_set_name(tensor, name);
         
         model_.tensors[name] = tensor;
@@ -512,6 +562,12 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
                                          model_.tensors, model_.buffer, error_msg_,
                                          weight_backend)) {
             return false;
+        }
+        if (bytes_saved > 0) {
+            fprintf(stderr,
+                    "  AudioTokenizerDecoder Q8_0 load-time quant: pre_tfm+upsample mat-muls "
+                    "F16 -> Q8_0, saved %.1f MiB of vocoder weights\n",
+                    bytes_saved / (1024.0 * 1024.0));
         }
     }
     
@@ -1092,6 +1148,15 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
          // raw right-tail as the next state, and emit all samples up to the
          // right-tail boundary (dropping the leading `stride` warmup on the
          // very first chunk via n_past gating).
+         //
+         // Memory: ggml_acc_inplace writes overlap into raw[0:s] without
+         // allocating a second full-size buffer. The pre-fix concat path
+         // (head_plus + cont(rest_view) + concat) materialised ~3×new_seq_len
+         // F32 in flight for the deepest dec_block (~33 MiB on V1 dec4 at
+         // 60-frame chunks). With acc_inplace we keep just raw + emit_cont.
+         // Correctness vs ordering: acc_inplace only writes raw[0:s], while
+         // next_tail reads raw[new_seq_len-s : new_seq_len] — disjoint
+         // regions, so kernel submission order doesn't matter.
          const int s = upsample_rate;
          struct ggml_tensor * raw = x;
 
@@ -1125,20 +1190,16 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
              conv_t_overlap_hosts_[in_name].assign((size_t) s * out_channels, 0.0f);
          }
 
-         struct ggml_tensor * head_view = ggml_view_3d(
-             ctx, raw, s, out_channels, 1,
-             raw->nb[1], raw->nb[2], 0);
-         struct ggml_tensor * head_plus = ggml_add(ctx, ggml_cont(ctx, head_view), overlap);
-         struct ggml_tensor * rest_view = ggml_view_3d(
-             ctx, raw, new_seq_len - s, out_channels, 1,
-             raw->nb[1], raw->nb[2], s * raw->nb[0]);
-         struct ggml_tensor * combined = ggml_concat(ctx, head_plus, ggml_cont(ctx, rest_view), 0);
+         // raw[0:s] += overlap, in place — no extra buffer.
+         struct ggml_tensor * raw_acc = ggml_acc_inplace(
+             ctx, raw, overlap,
+             raw->nb[1], raw->nb[2], raw->nb[3], 0);
          // emit [left_pad : new_seq_len - s] on the first chunk (n_past==0),
          // else [0 : new_seq_len - s]. right-tail (last s) is always held back.
          int64_t emit_start = (n_past_ == 0) ? (int64_t) left_pad : 0;
          int64_t emit_len = (new_seq_len - s) - emit_start;
-         x = ggml_view_3d(ctx, combined, emit_len, out_channels, 1,
-                          combined->nb[1], combined->nb[2], emit_start * combined->nb[0]);
+         x = ggml_view_3d(ctx, raw_acc, emit_len, out_channels, 1,
+                          raw_acc->nb[1], raw_acc->nb[2], emit_start * raw_acc->nb[0]);
          x = ggml_cont(ctx, x);
          (void) out_seq_len;
      }
