@@ -1286,7 +1286,6 @@ int main(int argc, char ** argv) {
                  voice_n_ref_frames,
                  stream_batch_size, stream_first_batch_size, is_sse, is_wav,
                  synth_mutex = &synth_mutex,
-                 sample_rate_fallback = tts.get_sample_rate(),
                  voice = voice, warmup_path = warmup_path, model_id = model_id,
                  &ensure_loaded_locked]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
@@ -1298,10 +1297,14 @@ int main(int argc, char ** argv) {
 
                     // wav header up front (audio mode only). for SSE, the wav
                     // bytes per-delta are raw pcm — clients reconstruct wav.
+                    // Read sample_rate AFTER ensure_loaded so the lazy-load /
+                    // first-request path sees the real vocoder rate (48 kHz on
+                    // V2) rather than the audio_decoder_config default (24 kHz).
+                    const int wav_sample_rate = this_tts->get_sample_rate();
                     bool header_written = false;
                     auto ensure_header = [&]() {
                         if (!header_written && !is_sse && is_wav) {
-                            std::string hdr = wav_streaming_header(sample_rate_fallback);
+                            std::string hdr = wav_streaming_header(wav_sample_rate);
                             sink.write(hdr.data(), hdr.size());
                         }
                         header_written = true;
