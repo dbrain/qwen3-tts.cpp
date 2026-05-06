@@ -798,10 +798,14 @@ bool TTSTransformer::init_kv_cache(int32_t n_ctx) {
     state_.cache.k_cache.resize(cfg.n_layers);
     state_.cache.v_cache.resize(cfg.n_layers);
 
-    // QWEN3_TTS_KV_Q8=1 → Q8_0 K/V (auto-pairs with FA prefill in
-    // build_prefill_forward_graph). head_dim=128 is multiple of QK8_0=32.
-    const ggml_type kv_type =
-        (std::getenv("QWEN3_TTS_KV_Q8") != nullptr) ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+    // K/V cache type. Q8_0 K/V auto-pairs with FA prefill in
+    // build_prefill_forward_graph; head_dim=128 is a multiple of QK8_0=32.
+    // Default ON: ~64 MiB saved on the Q8 talker, ear-tested clean across
+    // the 27-prompt suite at no measurable RTFA hit. Set
+    // QWEN3_TTS_KV_Q8=0 to revert to F16 K/V.
+    const char * kv_q8_env = std::getenv("QWEN3_TTS_KV_Q8");
+    const bool   kv_q8     = (kv_q8_env == nullptr) || (kv_q8_env[0] && kv_q8_env[0] != '0');
+    const ggml_type kv_type = kv_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
 
     for (int il = 0; il < cfg.n_layers; ++il) {
         state_.cache.k_cache[il] = ggml_new_tensor_3d(
@@ -836,7 +840,7 @@ void TTSTransformer::clear_kv_cache() {
     }
 }
 
-// --- Talker prefill KV cache (item D in HANDOFF-perf-5) -------------------
+// --- Talker prefill KV cache --------------------------------------------
 
 // Bytes per cached position per layer per K-or-V tensor. Quant-aware:
 // works for F16 (sizeof) and Q8_0 (block-packed) without a special case.

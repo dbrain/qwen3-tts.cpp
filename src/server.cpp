@@ -522,6 +522,15 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
 }
 
 int main(int argc, char ** argv) {
+    // Server-side perf defaults. On qwen3-tts batch=1 autoregressive
+    // decode, CUDA graphs cost +~700 MiB peak (per-token graph rebuild
+    // dominates) with no measurable RTFA gain — talker step cgraphs
+    // re-allocate fresh tensors per frame so capture's per-key warmup
+    // never converges. Default OFF; set GGML_CUDA_DISABLE_GRAPHS=0
+    // to re-enable for workloads where capture does pay off.
+    // setenv overwrite=0 means an explicit operator-set value still wins.
+    setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
+
     server_params sp;
     if (!parse_args(argc, argv, sp)) {
         print_usage(argv[0]);
@@ -1119,25 +1128,21 @@ int main(int argc, char ** argv) {
         int         max_audio_tokens = body.value("max_audio_tokens", default_max_audio_tokens);
         float       repetition_penalty = body.value("repetition_penalty", sp.repetition_penalty);
         int64_t     seed               = body.value("seed", sp.seed);
-        int         stream_batch_size       = body.value("stream_batch_size", 0);
-        int         stream_first_batch_size = body.value("stream_first_batch_size", 0);
-        // Server-side defaults: when the request omits streaming params AND
-        // operator has configured defaults via env, opt the request into
-        // streaming. Both halve VRAM peak (vocoder graph/scratch bounded
-        // per batch) and improve TTFA. Body params always win. Operators
-        // who want all clients streaming can set both env vars; clients
-        // who want non-streaming explicitly set stream_batch_size=0 in
-        // the body.
-        if (!body.contains("stream_batch_size")) {
-            if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_BATCH_SIZE")) {
-                stream_batch_size = std::atoi(env);
-            }
+        // Server-side streaming defaults. Both halve VRAM peak (vocoder
+        // graph/scratch bounded per batch) and improve TTFA, with no
+        // measurable RTFA cost. Built-in defaults below match prod settings;
+        // env overrides them; per-request body always wins. Clients who
+        // want non-streaming explicitly set stream_batch_size=0 in the body.
+        int default_stream_batch_size       = 60;
+        int default_stream_first_batch_size = 1;
+        if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_BATCH_SIZE")) {
+            default_stream_batch_size = std::atoi(env);
         }
-        if (!body.contains("stream_first_batch_size")) {
-            if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_FIRST_BATCH_SIZE")) {
-                stream_first_batch_size = std::atoi(env);
-            }
+        if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_FIRST_BATCH_SIZE")) {
+            default_stream_first_batch_size = std::atoi(env);
         }
+        int stream_batch_size       = body.value("stream_batch_size",       default_stream_batch_size);
+        int stream_first_batch_size = body.value("stream_first_batch_size", default_stream_first_batch_size);
         if (stream_format.empty() && stream_batch_size > 0) {
             // unspecified stream_format with streaming on → assume the
             // chunked-audio variant (matches response_format).
