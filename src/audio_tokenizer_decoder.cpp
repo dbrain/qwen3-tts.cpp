@@ -22,6 +22,11 @@ AudioTokenizerDecoder::~AudioTokenizerDecoder() {
 }
 
 void AudioTokenizerDecoder::unload_model() {
+    // Drop per-stream metadata (n_past_, streaming_mode_, ring buffers,
+    // overlap-host maps, per-graph tails/conv_ts) before tearing down the
+    // model so a lazy-reload + stream_decode() without an explicit
+    // stream_reset() can't read stale state against a freshly-allocated slab.
+    stream_reset(0);
     free_stream_kv_cache();
     free_audio_decoder_model(model_);
 
@@ -1418,8 +1423,14 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
      // F32 internally so precision is preserved at gemm endpoints; only the
      // dst write rounds to F16). Cast back to F32 right before the final
      // snake so final_conv + tanh + audio output stay bit-identical to the
-     // F32 path. Default ON; QWEN3_TTS_VOCODER_FP16_CASCADE=0 reverts.
-     bool fp16_cascade = true;
+     // F32 path. Default ON for non-CPU backends; QWEN3_TTS_VOCODER_FP16_CASCADE
+     // overrides either way. CPU is opt-out by default because conv_1d_direct,
+     // conv_transpose_1d, and snake on the CPU backend lack F16-input kernels
+     // — the F32 path is the only thing that actually works there.
+     ggml_backend_dev_t cascade_dev = state_.backend ? ggml_backend_get_device(state_.backend) : nullptr;
+     const bool backend_is_cpu = cascade_dev &&
+         ggml_backend_dev_type(cascade_dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+     bool fp16_cascade = !backend_is_cpu;
      if (const char * env = std::getenv("QWEN3_TTS_VOCODER_FP16_CASCADE")) {
          fp16_cascade = !(env[0] == '0' && env[1] == '\0');
      }
@@ -1498,9 +1509,16 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
         error_msg_ = "Model not loaded";
         return false;
     }
-    
+
+    // Defensive: restore_stream_state() / a previous stream_decode() may have
+    // left streaming_mode_=true. The one-shot graph never wires inp_mask, so a
+    // stale streaming_mode_ would route apply_pre_tfm_layer down the FA branch
+    // that asserts on that tensor and reads uninitialised bytes.
+    streaming_mode_ = false;
+    n_past_ = 0;
+
     const auto & cfg = model_.config;
-    
+
     codes_buf_.resize(n_frames * cfg.n_codebooks);
     for (int f = 0; f < n_frames; ++f) {
         for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
