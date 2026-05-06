@@ -522,15 +522,6 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
 }
 
 int main(int argc, char ** argv) {
-    // Server-side perf defaults. On qwen3-tts batch=1 autoregressive
-    // decode, CUDA graphs cost +~700 MiB peak (per-token graph rebuild
-    // dominates) with no measurable RTFA gain — talker step cgraphs
-    // re-allocate fresh tensors per frame so capture's per-key warmup
-    // never converges. Default OFF; set GGML_CUDA_DISABLE_GRAPHS=0
-    // to re-enable for workloads where capture does pay off.
-    // setenv overwrite=0 means an explicit operator-set value still wins.
-    setenv("GGML_CUDA_DISABLE_GRAPHS", "1", 0);
-
     server_params sp;
     if (!parse_args(argc, argv, sp)) {
         print_usage(argv[0]);
