@@ -297,20 +297,11 @@ tts_result Qwen3TTS::synthesize_with_voice(const std::string & text,
     }
 
     if (!encoder_loaded_) {
-        const std::string & enc_path = !speaker_encoder_model_path_.empty()
-            ? speaker_encoder_model_path_
-            : tts_model_path_;
-        if (enc_path.empty()) {
-            result.error_msg = "Internal error: missing TTS model path for lazy encoder load";
-            return result;
-        }
         int64_t t_encoder_load_start = get_time_ms();
-        if (!audio_encoder_.load_model(enc_path)) {
-            result.error_msg = "Failed to load speaker encoder: " + audio_encoder_.get_error();
+        if (!ensure_encoder_loaded()) {
+            result.error_msg = error_msg_;
             return result;
         }
-        audio_encoder_.set_abort_callback(abort_cb_, abort_data_);
-        encoder_loaded_ = true;
         if (params.print_timing) {
             fprintf(stderr, "  Speaker encoder lazy-loaded in %lld ms\n",
                     (long long)(get_time_ms() - t_encoder_load_start));
@@ -392,20 +383,8 @@ bool Qwen3TTS::extract_speaker_embedding(const std::string & reference_audio,
         ref_samples = std::move(resampled);
     }
 
-    if (!encoder_loaded_) {
-        const std::string & enc_path = !speaker_encoder_model_path_.empty()
-            ? speaker_encoder_model_path_
-            : tts_model_path_;
-        if (enc_path.empty()) {
-            error_msg_ = "Internal error: missing TTS model path for lazy encoder load";
-            return false;
-        }
-        if (!audio_encoder_.load_model(enc_path)) {
-            error_msg_ = "Failed to load speaker encoder: " + audio_encoder_.get_error();
-            return false;
-        }
-        audio_encoder_.set_abort_callback(abort_cb_, abort_data_);
-        encoder_loaded_ = true;
+    if (!ensure_encoder_loaded()) {
+        return false;
     }
 
     if (!audio_encoder_.encode(ref_samples.data(), (int32_t)ref_samples.size(), embedding)) {
@@ -938,6 +917,41 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     }
     
     return result;
+}
+
+bool Qwen3TTS::ensure_encoder_loaded() {
+    if (encoder_loaded_) {
+        return true;
+    }
+    const std::string & enc_path = !speaker_encoder_model_path_.empty()
+        ? speaker_encoder_model_path_
+        : tts_model_path_;
+    if (enc_path.empty()) {
+        error_msg_ = "Internal error: missing TTS model path for lazy encoder load";
+        return false;
+    }
+    if (!audio_encoder_.load_model(enc_path)) {
+        error_msg_ = "Failed to load speaker encoder: " + audio_encoder_.get_error();
+        return false;
+    }
+    audio_encoder_.set_abort_callback(abort_cb_, abort_data_);
+
+    // The encoder's output (embedding_dim) is added directly into talker
+    // hidden states (hidden_size floats), so the two MUST match. A silent
+    // mismatch would read past the end of the embedding buffer in the talker
+    // prompt assembly. Fail fast here instead.
+    const int32_t enc_dim = audio_encoder_.get_config().embedding_dim;
+    const int32_t hsize   = transformer_.get_config().hidden_size;
+    if (enc_dim != hsize) {
+        audio_encoder_.unload_model();
+        error_msg_ = "Speaker encoder embedding_dim (" + std::to_string(enc_dim)
+                   + ") != talker hidden_size (" + std::to_string(hsize)
+                   + "); encoder GGUF does not match the TTS model";
+        return false;
+    }
+
+    encoder_loaded_ = true;
+    return true;
 }
 
 int32_t Qwen3TTS::get_hidden_size() const {

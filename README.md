@@ -49,7 +49,7 @@ The submodule pointer in `.gitmodules` references this fork. From upstream `ggml
 
 ### A note on "RTF"
 
-This fork uses **RTF as audio-seconds-per-wall-second** (higher is better — 2.78 means we produce ~2.78 s of audio per wall-second of compute). The strict definition (wall / audio, lower is better) is the inverse. We've kept the audio-per-wall convention to stay consistent with the upstream khimaros benchmarks.
+This fork (and our up-fork PyTorch reference, [faster-qwen3-tts](https://github.com/qwen-research/faster-qwen3-tts)) reports **RTF as audio-seconds-per-wall-second** (higher is better — 2.78 means we produce ~2.78 s of audio per wall-second of compute). The strict definition (wall / audio, lower is better) is the inverse. We've kept the audio-per-wall convention so numbers compare apples-to-apples with faster-qwen3-tts's bench script.
 
 ### Quant ladder on Ampere (RTX 3060) — single-stream decode
 
@@ -60,12 +60,6 @@ This fork uses **RTF as audio-seconds-per-wall-second** (higher is better — 2.
 | Q4_K_M | 2.11 | 1000 MiB | only useful when VRAM-bound or on pre-Volta GPUs (Q4_K MMQ is slow on cc=86) |
 
 Don't promote F16 or Q4_K_M to default on Ampere. Q8_0 is the sweet spot.
-
-### Known gaps / next-agent inheritance
-
-- **Vocoder VRAM**: 5 of the vocoder's `conv_transpose_1d` ops still fall back to CPU because ggml's CUDA kernel only supports F32 weights and the vocoder uses F16. The CPU fallback eats ~158 MiB scheduler memory plus CPU↔GPU staging buffers (~110 MiB CUDA scheduler) per call. The naive CUDA kernel is too slow on these shapes (a templated F16 extension was tried and ran ~1000× slower than the CPU fallback). The right fix is a smem-tiled F16 `conv_transpose_1d` kernel, parallel to the existing `conv_1d_direct` wmma work.
-- **48 kHz vocoder**: the takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz model is a V2 architecture (5 decoder blocks vs 4, codebook_dim 512 vs 256) — not a drop-in for the V1 vocoder cascade in `audio_tokenizer_decoder.cpp`. Needs config-driven `upsample_rates` + `dec_blocks[]` and an updated `convert_tokenizer_to_gguf.py` for V2 tensor names.
-- **F32 speaker encoder**: the encoder asserts F16 weights (the `conv_1d_direct` path is F16-only); F32 spk_enc would need either a new code path or a bias dtype that's already F32 anyway. Not worth pursuing — the F16 spk_enc sidecar is bit-identical to the embeddings produced from the upstream BF16 weights for ECAPA-TDNN-class encoders.
 
 ---
 

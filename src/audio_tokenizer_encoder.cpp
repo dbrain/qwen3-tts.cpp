@@ -246,8 +246,28 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
             }
         }
     }
-    
-    if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx, 
+
+    // Derive embedding_dim from the actual fc weight (out_channels = ne[2] for
+    // ggml_conv_1d weights). The GGUF metadata key is advisory; the tensor is
+    // authoritative. Older or hand-built GGUFs may be missing the key, in
+    // which case the loader fell back to 1024 — wrong on 1.7B (2048).
+    if (!model_.fc_w) {
+        error_msg_ = "spk_enc.fc.weight missing";
+        return false;
+    }
+    const int32_t fc_out_dim = (int32_t) model_.fc_w->ne[2];
+    if (fc_out_dim <= 0) {
+        error_msg_ = "spk_enc.fc.weight has invalid out_channels";
+        return false;
+    }
+    if (fc_out_dim != model_.config.embedding_dim) {
+        fprintf(stderr,
+                "  speaker_encoder: embedding_dim from tensor=%d overrides metadata=%d\n",
+                fc_out_dim, model_.config.embedding_dim);
+        model_.config.embedding_dim = fc_out_dim;
+    }
+
+    if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
                                      model_.tensors, model_.buffer, error_msg_)) {
         return false;
     }

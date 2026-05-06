@@ -293,6 +293,11 @@ private:
                                    int32_t n_ref_frames = 0,
                                    const streaming_opts * stream = nullptr);
 
+    // Lazy-load the speaker encoder and verify its embedding dim matches
+    // the talker's hidden_size. Sets error_msg_ and returns false on
+    // failure. Idempotent.
+    bool ensure_encoder_loaded();
+
     bool is_aborted() const { return abort_cb_ && abort_cb_(abort_data_); }
     
     TextTokenizer tokenizer_;
