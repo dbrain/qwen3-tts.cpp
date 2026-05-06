@@ -61,6 +61,12 @@ This fork (and our up-fork PyTorch reference, [faster-qwen3-tts](https://github.
 
 Don't promote F16 or Q4_K_M to default on Ampere. Q8_0 is the sweet spot.
 
+### Current limitations
+
+- **Vocoder VRAM is fatter than ideal**: 5 of the vocoder's `conv_transpose_1d` ops fall back to CPU because ggml's CUDA kernel only supports F32 weights and the vocoder uses F16. The CPU fallback eats ~158 MiB scheduler memory plus ~110 MiB CUDA-side staging buffers per call. Output is correct, but per-call vocoder peak is ~250 MiB higher than it has to be. The fix is a smem-tiled F16 `conv_transpose_1d` kernel parallel to the existing `conv_1d_direct` wmma kernel; not yet written.
+- **24 kHz output only**: a 48 kHz "V2" tokenizer ([takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz](https://huggingface.co/takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz)) exists upstream but is not a drop-in: it's a structurally different vocoder (5 decoder blocks instead of 4, codebook_dim 512 instead of 256). Supporting it requires config-driven sizing in `audio_tokenizer_decoder.{h,cpp}` and updates to `convert_tokenizer_to_gguf.py` for V2 tensor names.
+- **Speaker-encoder weights are F16-only**: the ECAPA-TDNN encoder dispatches conv layers through the F16-only `conv_1d_direct` path. F32 weights for the speaker encoder aren't supported, but in practice this isn't a quality limitation — the upstream BF16 weights downcast bit-identically to F16 for ECAPA-TDNN-class encoders, and the bias-add op already requires F32 biases (which is what GGUF stores them as).
+
 ---
 
 ## Added In Khimaros' Fork
