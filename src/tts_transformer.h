@@ -194,6 +194,12 @@ struct tts_kv_cache {
     int32_t head_dim = 128;
     int32_t n_kv_heads = 8;
     int32_t n_layers = 28;
+    // Soft cap for lazy growth, set per-synth from worst_case (prefill +
+    // max_audio_tokens + 8). Caps overshoot when audio decode hits the
+    // requested ceiling — without it, geometric/round-up growth allocates
+    // the next 2048-step beyond worst_case (60-120 MiB regression vs eager
+    // alloc on max-budget synths). 0 = no cap.
+    int32_t max_n_ctx_hint = 0;
 };
 
 // TTS Transformer state
@@ -222,6 +228,13 @@ public:
     
     // Initialize KV cache
     bool init_kv_cache(int32_t n_ctx);
+
+    // Lazily grow the KV cache to at least `target_n_ctx` slots, preserving
+    // the populated [0, n_used) rows. No-op if current capacity is enough.
+    // Used to defer the worst-case n_ctx allocation: synth starts with a
+    // small budget and only pays for slots audio actually consumes. Mirrors
+    // the vocoder's stream-KV slab grow pattern.
+    bool grow_kv_cache(int32_t target_n_ctx);
 
     // Clear KV cache
     void clear_kv_cache();

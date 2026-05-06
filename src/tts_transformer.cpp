@@ -840,6 +840,131 @@ void TTSTransformer::clear_kv_cache() {
     }
 }
 
+bool TTSTransformer::grow_kv_cache(int32_t target_n_ctx) {
+    auto & cache = state_.cache;
+    if (target_n_ctx <= cache.n_ctx) return true;
+
+    const int32_t old_n_ctx = cache.n_ctx;
+    // Round up to next 2048-frame step (≈ 124 MiB at Q8_0). Coarse enough
+    // that we re-alloc at most once per ~2.7 minutes of 12.5 Hz audio,
+    // fine enough that an early-terminating max-budget synth doesn't pay
+    // for the full worst-case ctx. Pure doubling overshoots badly: a
+    // 4644-frame synth that should fit in ~6k ctx grows 2084 → 4168 → 8336
+    // and burns ~130 MiB on the wasted half-of-the-final-doubling.
+    constexpr int32_t kGrowStep = 2048;
+    int32_t new_n_ctx = ((target_n_ctx + kGrowStep - 1) / kGrowStep) * kGrowStep;
+    if (new_n_ctx < cache.n_ctx + kGrowStep) new_n_ctx = cache.n_ctx + kGrowStep;
+    // If forward() pinned a max_n_ctx_hint (worst_case for this synth),
+    // cap the grow there. Without this, hitting max_audio_tokens triggers
+    // a final round-up that pushes alloc 1-2k slots past worst_case (60-
+    // 120 MiB at Q8_0). Allow target itself to exceed the cap (defensive
+    // for an off-by-one on the boundary frame) but don't ROUND UP past it.
+    if (cache.max_n_ctx_hint > 0 && new_n_ctx > cache.max_n_ctx_hint) {
+        new_n_ctx = std::max(target_n_ctx, cache.max_n_ctx_hint);
+    }
+
+    if (cache.k_cache.empty() || cache.ctx == nullptr) {
+        // Cold cache — just init at the new size; nothing to preserve.
+        return init_kv_cache(new_n_ctx);
+    }
+
+    const int n_layers = cache.n_layers;
+    const ggml_type kv_type = cache.k_cache[0]->type;
+    const int32_t saved_n_used = cache.n_used;
+    // Bytes per cached position per layer per K-or-V tensor — inlined here
+    // because kv_pos_stride() is defined further down with the prefill-cache
+    // helpers; pulling it forward would tangle the file. Quant-aware:
+    // ggml_row_size handles F16/Q8_0 alike (head_dim=128 is QK8_0-aligned).
+    const size_t row_bytes =
+        (size_t) ggml_row_size(kv_type, cache.head_dim) * (size_t) cache.n_kv_heads;
+
+    // Bounce populated rows to host so we can free the old GPU buffer before
+    // alloc'ing the new (avoids double-residency at the swap point).
+    std::vector<std::vector<uint8_t>> saved_k(n_layers);
+    std::vector<std::vector<uint8_t>> saved_v(n_layers);
+    if (saved_n_used > 0) {
+        const size_t bytes = row_bytes * (size_t) saved_n_used;
+        for (int il = 0; il < n_layers; ++il) {
+            saved_k[il].resize(bytes);
+            saved_v[il].resize(bytes);
+            ggml_backend_tensor_get(cache.k_cache[il], saved_k[il].data(), 0, bytes);
+            ggml_backend_tensor_get(cache.v_cache[il], saved_v[il].data(), 0, bytes);
+        }
+    }
+
+    // Free old context + buffer, then alloc new at the larger size. Don't
+    // call init_kv_cache (it re-reads QWEN3_TTS_KV_Q8 env and re-derives
+    // cfg fields — fine on cold init, redundant on grow). Hand-roll the
+    // alloc using the same kv_type we already had, to keep dtype stable.
+    ggml_backend_buffer_free(cache.buffer);
+    ggml_free(cache.ctx);
+    cache.buffer = nullptr;
+    cache.ctx = nullptr;
+    cache.k_cache.clear();
+    cache.v_cache.clear();
+
+    const size_t n_tensors = (size_t) n_layers * 2;
+    const size_t ctx_size  = n_tensors * ggml_tensor_overhead();
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ctx_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    cache.ctx = ggml_init(params);
+    if (!cache.ctx) {
+        error_msg_ = "Failed to create KV cache context (grow)";
+        return false;
+    }
+    cache.k_cache.resize(n_layers);
+    cache.v_cache.resize(n_layers);
+    for (int il = 0; il < n_layers; ++il) {
+        cache.k_cache[il] = ggml_new_tensor_3d(cache.ctx, kv_type,
+                                               cache.head_dim, cache.n_kv_heads, new_n_ctx);
+        ggml_format_name(cache.k_cache[il], "k_cache_%d", il);
+        cache.v_cache[il] = ggml_new_tensor_3d(cache.ctx, kv_type,
+                                               cache.head_dim, cache.n_kv_heads, new_n_ctx);
+        ggml_format_name(cache.v_cache[il], "v_cache_%d", il);
+    }
+    cache.buffer = ggml_backend_alloc_ctx_tensors(cache.ctx, state_.backend);
+    if (!cache.buffer) {
+        error_msg_ = "Failed to allocate KV cache buffer (grow)";
+        free_tts_kv_cache(cache);
+        return false;
+    }
+    cache.n_ctx = new_n_ctx;
+    cache.n_used = saved_n_used;
+
+    // Restore populated rows then zero the unpopulated tail (FA mask covers
+    // the tail but stale bytes can still upset diag_mask paths).
+    if (saved_n_used > 0) {
+        const size_t bytes = row_bytes * (size_t) saved_n_used;
+        for (int il = 0; il < n_layers; ++il) {
+            ggml_backend_tensor_set(cache.k_cache[il], saved_k[il].data(), 0, bytes);
+            ggml_backend_tensor_set(cache.v_cache[il], saved_v[il].data(), 0, bytes);
+            const size_t total = ggml_nbytes(cache.k_cache[il]);
+            if (total > bytes) {
+                ggml_backend_tensor_memset(cache.k_cache[il], 0, bytes, total - bytes);
+                ggml_backend_tensor_memset(cache.v_cache[il], 0, bytes, total - bytes);
+            }
+        }
+    } else {
+        for (int il = 0; il < n_layers; ++il) {
+            ggml_backend_tensor_memset(cache.k_cache[il], 0, 0, ggml_nbytes(cache.k_cache[il]));
+            ggml_backend_tensor_memset(cache.v_cache[il], 0, 0, ggml_nbytes(cache.v_cache[il]));
+        }
+    }
+
+    if (verbose_) {
+        fprintf(stderr,
+                "  talker KV cache grown: n_ctx %d -> %d, %s, %.1f MiB%s\n",
+                old_n_ctx, new_n_ctx,
+                ggml_type_name(kv_type),
+                (double) ggml_backend_buffer_get_size(cache.buffer) / (1024.0 * 1024.0),
+                saved_n_used > 0 ? " (preserved populated rows)" : " (cold)");
+    }
+    return true;
+}
+
 // --- Talker prefill KV cache --------------------------------------------
 
 // Bytes per cached position per layer per K-or-V tensor. Quant-aware:
@@ -2546,8 +2671,11 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
     }
 
     if (n_past + 1 > state_.cache.n_ctx) {
-        error_msg_ = "Context length exceeded";
-        return false;
+        // Lazy grow: forward() seeds the cache with an initial-audio-budget
+        // sized n_ctx; if audio decode runs longer we double until it fits.
+        if (!grow_kv_cache(n_past + 1)) {
+            return false;
+        }
     }
     
 #ifdef QWEN3_TTS_TIMING
@@ -3212,12 +3340,34 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
                 prefill_len, trailing_len, cacheable_len);
     }
 
-    const int32_t required_ctx = prefill_len + max_len + 8;
-    if (state_.cache.n_ctx < required_ctx || state_.cache.n_ctx > std::max<int32_t>(required_ctx * 2, 512)) {
+    // Worst-case capacity if audio decode runs to max_len (most synths
+    // terminate early, so we don't allocate this up front). Used only as a
+    // shrink-trigger and an upper-cap for grow events.
+    const int32_t worst_case_ctx = prefill_len + max_len + 8;
+    // Pin the cap so grow_kv_cache stops at worst_case instead of rounding
+    // past it on the final 2048-step. Refreshed each synth.
+    state_.cache.max_n_ctx_hint = worst_case_ctx;
+    // Initial KV allocation: cover the prefill plus a small audio budget
+    // (enough that paragraph-sized synths finish without a single grow).
+    // Grown lazily via grow_kv_cache when audio decode pushes past it.
+    // QWEN3_TTS_TALKER_INITIAL_AUDIO overrides for benchmarking; default
+    // 1024 frames (~80s of 12.5Hz audio) covers the common paragraph case.
+    int32_t initial_audio_budget = 1024;
+    if (const char * env = std::getenv("QWEN3_TTS_TALKER_INITIAL_AUDIO")) {
+        if (env[0]) initial_audio_budget = std::max(64, atoi(env));
+    }
+    const int32_t initial_ctx = std::min(worst_case_ctx,
+                                         prefill_len + initial_audio_budget + 8);
+    // Shrink if currently >> worst_case (post-large-then-small synth) OR
+    // currently < the initial budget (prior synth had a tiny budget).
+    // Don't aggressively grow up to worst_case here — only grow lazily.
+    if (state_.cache.n_ctx < initial_ctx ||
+        state_.cache.n_ctx > std::max<int32_t>(worst_case_ctx * 2, 512)) {
         if (verbose_) {
-            fprintf(stderr, "  init kv cache: n_ctx=%d\n", required_ctx);
+            fprintf(stderr, "  init kv cache: n_ctx=%d (initial; worst-case %d)\n",
+                    initial_ctx, worst_case_ctx);
         }
-        if (!init_kv_cache(required_ctx)) {
+        if (!init_kv_cache(initial_ctx)) {
             return false;
         }
         // n_ctx changed → cached snapshots are still valid (host-side stores
