@@ -545,18 +545,31 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "resolved speaker-encoder: %s\n", sp.speaker_encoder.c_str());
     }
 
-    // load models
+    // load models. With QWEN3_TTS_LAZY_LOAD=1 the server starts with no
+    // GPU touched — set_model_paths() caches paths so that the first
+    // synth request (or /reload) drives load_model_files() via the same
+    // reload_model() codepath used by idle-unload. Lets the container
+    // boot alongside other GPU services without spiking VRAM.
     Qwen3TTS tts;
-    fprintf(stderr, "loading model: %s\n", sp.model.c_str());
-    if (!sp.vocoder.empty()) {
-        fprintf(stderr, "loading vocoder: %s\n", sp.vocoder.c_str());
+    bool lazy_load = false;
+    if (const char * env = std::getenv("QWEN3_TTS_LAZY_LOAD")) {
+        lazy_load = env[0] && env[0] != '0';
     }
-    if (!tts.load_model_files(sp.model, sp.vocoder, sp.speaker_encoder)) {
-        fprintf(stderr, "fatal: %s\n", tts.get_error().c_str());
-        return 1;
+    if (lazy_load) {
+        tts.set_model_paths(sp.model, sp.vocoder, sp.speaker_encoder);
+        fprintf(stderr, "lazy-load: model paths cached, deferring GPU load until first request\n");
+    } else {
+        fprintf(stderr, "loading model: %s\n", sp.model.c_str());
+        if (!sp.vocoder.empty()) {
+            fprintf(stderr, "loading vocoder: %s\n", sp.vocoder.c_str());
+        }
+        if (!tts.load_model_files(sp.model, sp.vocoder, sp.speaker_encoder)) {
+            fprintf(stderr, "fatal: %s\n", tts.get_error().c_str());
+            return 1;
+        }
+        fprintf(stderr, "models loaded (type=%s, speakers=%zu)\n",
+                tts.get_model_type().c_str(), tts.get_speaker_names().size());
     }
-    fprintf(stderr, "models loaded (type=%s, speakers=%zu)\n",
-            tts.get_model_type().c_str(), tts.get_speaker_names().size());
 
     // derive model id from filename (e.g. "qwen3-tts-0.6b-f16" from path)
     std::string model_id = sp.model;

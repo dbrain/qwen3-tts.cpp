@@ -276,6 +276,14 @@ public:
     // loaded. Returns false (with get_error()) on failure.
     bool reload_model();
 
+    // Cache model paths without touching GPU. Used by lazy-load mode in
+    // server.cpp: paths get registered up front so the first request (or
+    // /reload, or idle-unload reload) can drive load_model_files() — but
+    // startup itself doesn't touch the GPU. Safe to call before any load.
+    void set_model_paths(const std::string & tts_model_path,
+                         const std::string & vocoder_model_path,
+                         const std::string & speaker_encoder_model_path);
+
 private:
     tts_result synthesize_internal(const std::string & text,
                                    const float * speaker_embedding,

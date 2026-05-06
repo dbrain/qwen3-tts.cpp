@@ -1372,6 +1372,20 @@ bool Qwen3TTS::reload_model() {
                             speaker_encoder_model_path_);
 }
 
+void Qwen3TTS::set_model_paths(const std::string & tts_model_path,
+                               const std::string & vocoder_model_path,
+                               const std::string & speaker_encoder_model_path) {
+    tts_model_path_ = tts_model_path;
+    speaker_encoder_model_path_ = speaker_encoder_model_path;
+    if (vocoder_model_path.empty()) {
+        auto slash = tts_model_path.rfind('/');
+        std::string dir = (slash != std::string::npos) ? tts_model_path.substr(0, slash) : ".";
+        decoder_model_path_ = dir + "/qwen3-tts-tokenizer-f16.gguf";
+    } else {
+        decoder_model_path_ = vocoder_model_path;
+    }
+}
+
 void Qwen3TTS::set_progress_callback(tts_progress_callback_t callback) {
     progress_callback_ = callback;
 }
