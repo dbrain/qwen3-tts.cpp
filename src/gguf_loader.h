@@ -62,7 +62,11 @@ protected:
     std::string file_path_;
 };
 
-// Helper function to allocate and load tensor data from GGUF file
+// Helper function to allocate and load tensor data from GGUF file.
+// preferred_backend_type is required (no default) — silently defaulting to
+// CPU caused the speaker encoder to ride the op_offload churn path with the
+// reviewer flagging it as MED-3. Callers must now pick explicitly so the
+// CPU-vs-GPU intent is visible at the call site.
 bool load_tensor_data_from_file(
     const std::string & path,
     struct gguf_context * ctx,
@@ -70,7 +74,7 @@ bool load_tensor_data_from_file(
     const std::map<std::string, struct ggml_tensor *> & tensors,
     ggml_backend_buffer_t & buffer,
     std::string & error_msg,
-    enum ggml_backend_dev_type preferred_backend_type = GGML_BACKEND_DEVICE_TYPE_CPU
+    enum ggml_backend_dev_type preferred_backend_type
 );
 
 // Helper to initialize backend with GPU preference and CPU fallback

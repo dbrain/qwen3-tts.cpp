@@ -267,11 +267,19 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
         model_.config.embedding_dim = fc_out_dim;
     }
 
+    // Speaker encoder runs once per voice register (rare admin path) and is
+    // unloaded immediately after by the server. Wall is dominated by CPU mel
+    // (compute_mel_spectrogram is an O(n²) DFT, not FFT) — promoting the
+    // ~23 MiB of weights to GPU saves only the per-call host→device offload
+    // (single-digit ms on PCIe Gen3 x16) on a 5+ s register call. CPU keeps
+    // the buffer off the GPU pool entirely; sched still offloads conv1d /
+    // mat-mul ops to GPU via op_offload=true at compute time.
     if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
-                                     model_.tensors, model_.buffer, error_msg_)) {
+                                     model_.tensors, model_.buffer, error_msg_,
+                                     GGML_BACKEND_DEVICE_TYPE_CPU)) {
         return false;
     }
-    
+
     state_.backend = init_preferred_backend("AudioTokenizerEncoder", &error_msg_);
     if (!state_.backend) {
         return false;

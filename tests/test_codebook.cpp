@@ -53,8 +53,9 @@ int main() {
     
     ggml_backend_buffer_t buffer = nullptr;
     std::string error;
-    if (!qwen3_tts::load_tensor_data_from_file("models/qwen3-tts-tokenizer-f16.gguf", 
-                                                loader.get_ctx(), ctx, tensors, buffer, error)) {
+    if (!qwen3_tts::load_tensor_data_from_file("models/qwen3-tts-tokenizer-f16.gguf",
+                                                loader.get_ctx(), ctx, tensors, buffer, error,
+                                                GGML_BACKEND_DEVICE_TYPE_CPU)) {
         fprintf(stderr, "Failed to load tensor data: %s\n", error.c_str());
         return 1;
     }
