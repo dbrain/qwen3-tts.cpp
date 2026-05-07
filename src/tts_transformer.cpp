@@ -152,7 +152,7 @@ bool TTSTransformer::load_model(const std::string & model_path) {
         return false;
     }
     
-    state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead());
+    state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead_custom(QWEN3_TTS_MAX_NODES, false));
 
     if (!try_init_coreml_code_predictor(model_path)) {
         return false;
@@ -720,6 +720,7 @@ bool TTSTransformer::load_tensor_data(const std::string & path, struct gguf_cont
         release_preferred_backend(backend);
         return false;
     }
+    ggml_backend_buffer_set_usage(model_.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) {
@@ -824,7 +825,17 @@ bool TTSTransformer::init_kv_cache(int32_t n_ctx) {
         error_msg_ = "Failed to allocate KV cache buffer";
         return false;
     }
-    
+
+    // Zero the freshly-allocated K/V tensors so callers don't depend on
+    // an undefined-bytes invariant (some sched paths read partial regions
+    // before the first write).
+    for (auto * t : state_.cache.k_cache) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
+    for (auto * t : state_.cache.v_cache) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
+
     return true;
 }
 
@@ -1156,7 +1167,15 @@ bool TTSTransformer::init_code_pred_kv_cache(int32_t n_ctx) {
         error_msg_ = "Failed to allocate code predictor KV cache buffer";
         return false;
     }
-    
+
+    // Zero on init — see init_kv_cache for rationale.
+    for (auto * t : state_.code_pred_cache.k_cache) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
+    for (auto * t : state_.code_pred_cache.v_cache) {
+        if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+    }
+
     return true;
 }
 
@@ -2724,11 +2743,16 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
     // closed [n_past+1, kv_n_eff) — closed slots are the rounding pad.
     struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
     const int32_t kv_n_eff = (int32_t) inp_mask->ne[0];
-    std::vector<ggml_fp16_t> mask(kv_n_eff, ggml_fp32_to_fp16(-INFINITY));
-    for (int i = 0; i <= n_past && i < kv_n_eff; i++) {
-        mask[i] = ggml_fp32_to_fp16(0.0f);
+    if ((int32_t) step_mask_scratch_.size() < kv_n_eff) {
+        step_mask_scratch_.resize(kv_n_eff);
     }
-    ggml_backend_tensor_set(inp_mask, mask.data(), 0, (size_t) kv_n_eff * sizeof(ggml_fp16_t));
+    const ggml_fp16_t neg_inf_fp16 = ggml_fp32_to_fp16(-INFINITY);
+    const ggml_fp16_t zero_fp16    = ggml_fp32_to_fp16(0.0f);
+    std::fill_n(step_mask_scratch_.begin(), kv_n_eff, neg_inf_fp16);
+    for (int i = 0; i <= n_past && i < kv_n_eff; i++) {
+        step_mask_scratch_[i] = zero_fp16;
+    }
+    ggml_backend_tensor_set(inp_mask, step_mask_scratch_.data(), 0, (size_t) kv_n_eff * sizeof(ggml_fp16_t));
 
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
@@ -3207,11 +3231,17 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         }
 
         struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
-        std::vector<ggml_fp16_t> mask(state_.code_pred_cache.n_ctx, ggml_fp32_to_fp16(-INFINITY));
-        for (int i = 0; i <= n_past; i++) {
-            mask[i] = ggml_fp32_to_fp16(0.0f);
+        const int32_t mask_len = state_.code_pred_cache.n_ctx;
+        if ((int32_t) step_mask_scratch_.size() < mask_len) {
+            step_mask_scratch_.resize(mask_len);
         }
-        ggml_backend_tensor_set(inp_mask, mask.data(), 0, state_.code_pred_cache.n_ctx * sizeof(ggml_fp16_t));
+        const ggml_fp16_t neg_inf_fp16 = ggml_fp32_to_fp16(-INFINITY);
+        const ggml_fp16_t zero_fp16    = ggml_fp32_to_fp16(0.0f);
+        std::fill_n(step_mask_scratch_.begin(), mask_len, neg_inf_fp16);
+        for (int i = 0; i <= n_past && i < mask_len; i++) {
+            step_mask_scratch_[i] = zero_fp16;
+        }
+        ggml_backend_tensor_set(inp_mask, step_mask_scratch_.data(), 0, (size_t) mask_len * sizeof(ggml_fp16_t));
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();

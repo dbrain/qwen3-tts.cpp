@@ -280,7 +280,7 @@ bool AudioCodecEncoder::load_model(const std::string & model_path) {
         return false;
     }
 
-    state_.compute_meta.resize(ggml_tensor_overhead() * ENC_MAX_NODES + ggml_graph_overhead());
+    state_.compute_meta.resize(ggml_tensor_overhead() * ENC_MAX_NODES + ggml_graph_overhead_custom(ENC_MAX_NODES, false));
     return true;
 }
 
@@ -659,6 +659,8 @@ void AudioCodecEncoder::vq_encode(const float * features, int32_t n_frames,
     std::vector<float> residual(hidden);
     std::vector<float> quantized(dim);
     std::vector<float> dequant(hidden);
+    std::vector<float> acou_proj(dim);
+    std::vector<float> acou_residual(dim);
 
     // input_proj is stored as 1x1 conv weight: [dim, hidden, 1] in GGUF
     // ne[0]=1, ne[1]=hidden, ne[2]=dim → logically a [dim, hidden] matrix
@@ -705,10 +707,7 @@ void AudioCodecEncoder::vq_encode(const float * features, int32_t n_frames,
         // mimi SplitResidualVectorQuantizer runs the acoustic RVQ on the ORIGINAL
         // pre-VQ features (via its own input_proj), NOT on the semantic residual.
         // see transformers/models/mimi/modeling_mimi.py:1337-1342.
-        std::vector<float> acou_proj(dim);
         apply_proj(acou_in_proj.data(), feat, acou_proj.data(), dim, hidden);
-
-        std::vector<float> acou_residual(dim);
         for (int d = 0; d < dim; ++d) acou_residual[d] = acou_proj[d];
 
         for (int cb = 0; cb < 15 && cb < n_codes - 1; ++cb) {
@@ -751,6 +750,7 @@ bool AudioCodecEncoder::encode(const float * samples, int32_t n_samples,
 
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "failed to allocate encoder graph";
+        ggml_backend_sched_reset(state_.sched);
         return false;
     }
 

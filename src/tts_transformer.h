@@ -501,6 +501,10 @@ private:
     // Cached hidden states from last forward pass
     std::vector<float> last_hidden_;
     std::vector<ggml_fp16_t> embd_row_fp16_scratch_;
+    // Per-frame mask scratch reused across forward_step (talker) and the
+    // code-predictor step. They never overlap on the same frame, so one
+    // shared buffer is enough; grow on demand, never shrink.
+    std::vector<ggml_fp16_t> step_mask_scratch_;
     std::mt19937 rng_{std::random_device{}()};
     CoreMLCodePredictor coreml_code_predictor_;
     bool use_coreml_code_predictor_ = false;

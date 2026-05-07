@@ -299,7 +299,7 @@ bool AudioTokenizerEncoder::load_model(const std::string & model_path) {
         return false;
     }
     
-    state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead());
+    state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead_custom(QWEN3_TTS_MAX_NODES, false));
     
     return true;
 }
@@ -744,9 +744,10 @@ bool AudioTokenizerEncoder::encode(const float * samples, int32_t n_samples,
 
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
+        ggml_backend_sched_reset(state_.sched);
         return false;
     }
-    
+
     struct ggml_tensor * mel_tensor = ggml_graph_get_tensor(gf, "mel");
     if (!mel_tensor) {
         error_msg_ = "Failed to find mel tensor";

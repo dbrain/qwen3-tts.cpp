@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 
 namespace qwen3_tts {
 
@@ -17,6 +18,14 @@ shared_backend_state & get_shared_backend_state() {
     static shared_backend_state state;
     return state;
 }
+
+// Guards both backend pointer and ref_count for concurrent
+// init_preferred_backend / release_preferred_backend callers (e.g.
+// the C-API can be driven from worker threads).
+std::mutex & get_shared_backend_mutex() {
+    static std::mutex m;
+    return m;
+}
 }
 
 GGUFLoader::GGUFLoader() = default;
@@ -27,6 +36,8 @@ GGUFLoader::~GGUFLoader() {
 
 ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg) {
     if (error_msg) error_msg->clear();
+
+    std::lock_guard<std::mutex> lock(get_shared_backend_mutex());
 
     auto & shared = get_shared_backend_state();
     if (shared.backend) {
@@ -66,6 +77,8 @@ void release_preferred_backend(ggml_backend_t backend) {
     if (!backend) {
         return;
     }
+
+    std::lock_guard<std::mutex> lock(get_shared_backend_mutex());
 
     auto & shared = get_shared_backend_state();
     if (shared.backend == backend) {

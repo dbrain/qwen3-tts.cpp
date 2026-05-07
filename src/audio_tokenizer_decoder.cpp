@@ -691,7 +691,7 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         return false;
     }
 
-    state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_DEC_MAX_NODES + ggml_graph_overhead());
+    state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_DEC_MAX_NODES + ggml_graph_overhead_custom(QWEN3_TTS_DEC_MAX_NODES, false));
 
     // Per-stage decoder profile: QWEN3_TTS_DECODER_PROFILE=1 (named-tensor markers,
     // shows dec0..dec6 + per-residual sub-stages).
@@ -1564,9 +1564,10 @@ bool AudioTokenizerDecoder::decode(const int32_t * codes, int32_t n_frames,
 
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate graph";
+        ggml_backend_sched_reset(state_.sched);
         return false;
     }
-    
+
     std::vector<int32_t> cb_codes(n_frames);
     for (int cb = 0; cb < 16; ++cb) {
         char name[32];
@@ -1816,6 +1817,7 @@ bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frame
 
     if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
         error_msg_ = "Failed to allocate streaming graph";
+        ggml_backend_sched_reset(state_.sched);
         streaming_mode_ = false;
         return false;
     }
