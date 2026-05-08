@@ -504,7 +504,13 @@ private:
     // "inp_hidden", "inp_cb0_embd", "inp_pos_all" [16] i32,
     // "inp_mask_all" [n_ctx, 14] f16, "inp_gumbel_all" [top_k, 15] f32
     // (only when temperature > 0).
-    struct ggml_cgraph * build_code_pred_full_ar_graph(float temperature, int32_t top_k);
+    //
+    // Caller supplies ctx + gf so the cgraph can be cached across frames
+    // (the topology depends only on temperature/top_k; data values flow
+    // through the named inputs each frame).
+    void build_code_pred_full_ar_graph_into(struct ggml_context * ctx0,
+                                              struct ggml_cgraph * gf,
+                                              float temperature, int32_t top_k);
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);

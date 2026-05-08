@@ -2618,7 +2618,9 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_code_pred_full_ar_graph(float temperature, int32_t top_k) {
+void TTSTransformer::build_code_pred_full_ar_graph_into(struct ggml_context * ctx0,
+                                                          struct ggml_cgraph * gf,
+                                                          float temperature, int32_t top_k) {
     // Single cgraph for the entire code-pred AR loop:
     //   prefill (2 tokens, manual attention) → 14 step subgraphs (FA over KV cache).
     // The sampled-token tensor of step N feeds step N+1's embed lookup as a
@@ -2644,15 +2646,6 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_full_ar_graph(float tempera
     const int32_t n_ctx_kv = state_.code_pred_cache.n_ctx;
     constexpr int kNArSteps   = 14;
     constexpr int kNOutputs   = 15; // 1 prefill + 14 AR steps
-
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
 
     // === Shared inputs ===
     struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
@@ -2906,9 +2899,6 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_full_ar_graph(float tempera
             ctx0, gf, logits_st, temperature, top_k,
             gumbel_view_for(step), sampled_name);
     }
-
-    ggml_free(ctx0);
-    return gf;
 }
 
 bool TTSTransformer::forward_prefill(const float * prefill_embd, int32_t n_tokens,
@@ -3515,7 +3505,19 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        struct ggml_cgraph * gf = build_code_pred_full_ar_graph(temperature, gumbel_top_k);
+        // Build the unified cgraph fresh per call. Cross-frame caching
+        // of the cgraph object causes ggml-backend-sched to misroute
+        // SET_ROWS into the K/V cache view on the 2nd alloc (pre-
+        // allocated-buffer error) — kept simple here; the per-call build
+        // is only ~0.2 ms/frame so the cache wasn't worth the routing pain.
+        struct ggml_init_params ip = {
+            /*.mem_size   =*/ state_.compute_meta.size(),
+            /*.mem_buffer =*/ state_.compute_meta.data(),
+            /*.no_alloc   =*/ true,
+        };
+        struct ggml_context * full_ar_ctx = ggml_init(ip);
+        struct ggml_cgraph * gf = ggml_new_graph_custom(full_ar_ctx, QWEN3_TTS_MAX_NODES, false);
+        build_code_pred_full_ar_graph_into(full_ar_ctx, gf, temperature, gumbel_top_k);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3523,6 +3525,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #endif
         if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
             error_msg_ = "Failed to allocate code predictor full-AR graph";
+            ggml_free(full_ar_ctx);
             return false;
         }
 #ifdef QWEN3_TTS_TIMING
@@ -3586,6 +3589,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
             error_msg_ = "Failed to compute code predictor full-AR graph";
             ggml_backend_sched_reset(state_.sched);
+            ggml_free(full_ar_ctx);
             return false;
         }
 #ifdef QWEN3_TTS_TIMING
@@ -3601,6 +3605,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             if (!sampled) {
                 error_msg_ = std::string("Failed to find ") + name + " in full-AR graph";
                 ggml_backend_sched_reset(state_.sched);
+                ggml_free(full_ar_ctx);
                 return false;
             }
             int32_t v = 0;
@@ -3609,6 +3614,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         }
 
         ggml_backend_sched_reset(state_.sched);
+        ggml_free(full_ar_ctx);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();

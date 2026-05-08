@@ -1106,9 +1106,14 @@ bool is_installed() { return s_installed; }
 bool install() {
     if (s_installed) return false;
 
-    const char * env = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ");
-    if (!env || env[0] == '\0' || std::strcmp(env, "0") == 0) {
-        return false;
+    // Default ON (the v7 megakernel + Phase 2 unified AR cgraph stack is
+    // the production fast path). Opt-OUT only — set
+    // QWEN3_TTS_SPECIALIZED_MMVQ=0 if you need to fall back to ggml's
+    // stock MMVQ for A/B comparison or correctness debugging.
+    if (const char * env = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ")) {
+        if (env[0] != '\0' && std::strcmp(env, "0") == 0) {
+            return false;
+        }
     }
 
     if (const char * f = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_FUSION")) {
