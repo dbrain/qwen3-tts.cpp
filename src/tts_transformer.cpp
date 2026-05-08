@@ -2223,7 +2223,65 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
+struct ggml_tensor * TTSTransformer::append_gpu_sampling(struct ggml_context * ctx,
+                                                           struct ggml_cgraph * gf,
+                                                           struct ggml_tensor * logits,
+                                                           float temperature,
+                                                           int32_t top_k,
+                                                           const char * gumbel_input_name,
+                                                           const char * sampled_output_name) {
+    // Greedy / argmax path: temperature <= 0 mirrors the host argmax fallback.
+    // logits is [V, 1] (matrix), ggml_argmax returns [1] i32 = argmax along ne[0].
+    if (temperature <= 0.0f) {
+        struct ggml_tensor * sampled = ggml_argmax(ctx, logits);
+        ggml_set_name(sampled, sampled_output_name);
+        ggml_set_output(sampled);
+        ggml_build_forward_expand(gf, sampled);
+        return sampled;
+    }
+
+    // Gumbel-max categorical sampling restricted to top-K candidates.
+    //   1. scale(logits, 1/T)                 [V, 1]
+    //   2. top_k(K)                           [K, 1]    i32 indices
+    //   3. get_rows(scaled_1xV, top_k_idx)    [1, K]    f32 — gather top-K logit values
+    //   4. add(gumbel)                        [K, 1]    f32 — Gumbel-max trick
+    //   5. argmax                             [1]       i32 — relative index in [0, K)
+    //   6. get_rows(top_k_idx_1xK, rel_idx)   [1, 1]    i32 — absolute vocab id
+    //
+    // Mathematically equivalent to: temp-scale → top-K → softmax →
+    // discrete_distribution sample. Different RNG stream than host path,
+    // so per-seed audio bits differ but the distribution is identical.
+    const int64_t V = logits->ne[0];
+    const float scale = 1.0f / temperature;
+
+    struct ggml_tensor * scaled = ggml_scale(ctx, logits, scale);                    // [V, 1]
+    struct ggml_tensor * topk_idx = ggml_top_k(ctx, scaled, top_k);                  // [K, 1] i32
+
+    // Reshape scaled logits to "1-element rows" so get_rows scatters K scalars.
+    struct ggml_tensor * scaled_rows = ggml_reshape_2d(ctx, scaled, 1, V);           // [1, V]
+    struct ggml_tensor * topk_vals = ggml_get_rows(ctx, scaled_rows, topk_idx);      // [1, K] f32
+
+    struct ggml_tensor * topk_vals_flat = ggml_reshape_2d(ctx, topk_vals, top_k, 1); // [K, 1]
+
+    struct ggml_tensor * gumbel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, top_k, 1);
+    ggml_set_name(gumbel, gumbel_input_name);
+    ggml_set_input(gumbel);
+
+    struct ggml_tensor * with_noise = ggml_add(ctx, topk_vals_flat, gumbel);         // [K, 1]
+    struct ggml_tensor * rel_idx = ggml_argmax(ctx, with_noise);                     // [1] i32
+
+    // Reshape top_k_idx to "1-element rows" of K entries so the final get_rows
+    // returns 1 i32 = the absolute vocab id of the sampled token.
+    struct ggml_tensor * topk_idx_rows = ggml_reshape_2d(ctx, topk_idx, 1, top_k);   // [1, K] i32
+    struct ggml_tensor * sampled = ggml_get_rows(ctx, topk_idx_rows, rel_idx);       // [1, 1] i32
+
+    ggml_set_name(sampled, sampled_output_name);
+    ggml_set_output(sampled);
+    ggml_build_forward_expand(gf, sampled);
+    return sampled;
+}
+
+struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph(float temperature, int32_t top_k) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
@@ -2376,12 +2434,15 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
 
     ggml_build_forward_expand(gf, logits);
 
+    append_gpu_sampling(ctx0, gf, logits, temperature, top_k, "inp_gumbel", "sampled_token");
+
     ggml_free(ctx0);
 
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past*/, int32_t generation_step) {
+struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past*/, int32_t generation_step,
+                                                                  float temperature, int32_t top_k) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
@@ -2532,11 +2593,13 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
      struct ggml_tensor * logits = ggml_mul_mat(ctx0, model_.code_pred_head[generation_step], cur);
      ggml_set_name(logits, "logits");
      ggml_set_output(logits);
-     
+
      ggml_build_forward_expand(gf, logits);
-    
+
+     append_gpu_sampling(ctx0, gf, logits, temperature, top_k, "inp_gumbel", "sampled_token");
+
     ggml_free(ctx0);
-    
+
     return gf;
 }
 
@@ -3101,52 +3164,30 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         }
     }
     clear_code_pred_kv_cache();
-    
+
     output.resize(15);
-    std::vector<float> logits_data(cfg.code_pred_vocab_size);
-    
-    std::vector<float> code_probs(cfg.code_pred_vocab_size);
-    
-    // Helper lambda: temperature + top-k sampling (or greedy if temperature <= 0)
-    auto sample_or_argmax = [&](float * logits_ptr, int32_t vocab_size) -> int32_t {
-        if (temperature <= 0.0f) {
-            return argmax(logits_ptr, vocab_size);
+
+    // GPU-side sampling: clamp top_k to vocab size + at-least-1, generate
+    // Gumbel noise once per AR step from rng_ (preserves --seed
+    // determinism on the host RNG side; the sampling distribution is
+    // identical to the host softmax + discrete_distribution path, but the
+    // RNG draws differ so per-seed audio bytes will differ — this is the
+    // documented Phase 1 acceptance trade-off).
+    const int32_t gumbel_top_k = (temperature > 0.0f)
+        ? std::clamp<int32_t>(top_k <= 0 ? cfg.code_pred_vocab_size : top_k, 1, cfg.code_pred_vocab_size)
+        : 1;
+    constexpr int32_t kCodePredSteps = 15; // 1 prefill + 14 AR steps
+    if (temperature > 0.0f) {
+        const size_t needed = (size_t) gumbel_top_k * kCodePredSteps;
+        if (code_pred_gumbel_scratch_.size() < needed) {
+            code_pred_gumbel_scratch_.resize(needed);
         }
-        // Temperature scaling
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            logits_ptr[i] /= temperature;
+        std::uniform_real_distribution<float> u01(std::numeric_limits<float>::min(), 1.0f);
+        for (size_t i = 0; i < needed; ++i) {
+            float u = u01(rng_);
+            code_pred_gumbel_scratch_[i] = -logf(-logf(u));
         }
-        // Top-k filtering
-        if (top_k > 0 && top_k < vocab_size) {
-            std::vector<std::pair<float, int32_t>> scored(vocab_size);
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                scored[i] = {logits_ptr[i], i};
-            }
-            std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                    return a.first > b.first;
-                });
-            float threshold = scored[top_k - 1].first;
-            for (int32_t i = 0; i < vocab_size; ++i) {
-                if (logits_ptr[i] < threshold) {
-                    logits_ptr[i] = -INFINITY;
-                }
-            }
-        }
-        // Softmax
-        float max_logit = *std::max_element(logits_ptr, logits_ptr + vocab_size);
-        double sum = 0.0;
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            code_probs[i] = expf(logits_ptr[i] - max_logit);
-            sum += code_probs[i];
-        }
-        for (int32_t i = 0; i < vocab_size; ++i) {
-            code_probs[i] = (float)(code_probs[i] / sum);
-        }
-        // Sample
-        std::discrete_distribution<int32_t> dist(code_probs.begin(), code_probs.begin() + vocab_size);
-        return dist(rng_);
-    };
+    }
     
     std::vector<float> cb0_embd(cfg.hidden_size);
     if (!lookup_single_embedding_row(model_.codec_embd, codebook_0_token, cb0_embd.data())) {
@@ -3166,7 +3207,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        struct ggml_cgraph * gf = build_code_pred_prefill_graph();
+        struct ggml_cgraph * gf = build_code_pred_prefill_graph(temperature, gumbel_top_k);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3203,6 +3244,15 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             ggml_backend_tensor_set(inp_pos, positions, 0, 2 * sizeof(int32_t));
         }
 
+        if (temperature > 0.0f) {
+            struct ggml_tensor * inp_gumbel = ggml_graph_get_tensor(gf, "inp_gumbel");
+            if (inp_gumbel) {
+                ggml_backend_tensor_set(inp_gumbel,
+                                         code_pred_gumbel_scratch_.data() + 0 * (size_t) gumbel_top_k,
+                                         0, (size_t) gumbel_top_k * sizeof(float));
+            }
+        }
+
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3220,10 +3270,10 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_compute_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
-        
-        struct ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
-        if (!logits) {
-            error_msg_ = "Failed to find logits tensor in prefill";
+
+        struct ggml_tensor * sampled_token = ggml_graph_get_tensor(gf, "sampled_token");
+        if (!sampled_token) {
+            error_msg_ = "Failed to find sampled_token tensor in prefill";
             ggml_backend_sched_reset(state_.sched);
             return false;
         }
@@ -3231,11 +3281,10 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        ggml_backend_tensor_get(logits, logits_data.data(), 0, 
-                                 cfg.code_pred_vocab_size * sizeof(float));
-        
-        output[0] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
-        
+        int32_t sampled = 0;
+        ggml_backend_tensor_get(sampled_token, &sampled, 0, sizeof(int32_t));
+        output[0] = sampled;
+
         ggml_backend_sched_reset(state_.sched);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
@@ -3254,7 +3303,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        struct ggml_cgraph * gf = build_code_pred_step_graph(n_past, step);
+        struct ggml_cgraph * gf = build_code_pred_step_graph(n_past, step, temperature, gumbel_top_k);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3304,6 +3353,15 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             step_mask_scratch_[i] = zero_fp16;
         }
         ggml_backend_tensor_set(inp_mask, step_mask_scratch_.data(), 0, (size_t) mask_len * sizeof(ggml_fp16_t));
+
+        if (temperature > 0.0f) {
+            struct ggml_tensor * inp_gumbel = ggml_graph_get_tensor(gf, "inp_gumbel");
+            if (inp_gumbel) {
+                ggml_backend_tensor_set(inp_gumbel,
+                                         code_pred_gumbel_scratch_.data() + (size_t) step * (size_t) gumbel_top_k,
+                                         0, (size_t) gumbel_top_k * sizeof(float));
+            }
+        }
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -3321,10 +3379,10 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         t1 = clk::now();
         if (timing_) timing_->t_code_pred_compute_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
-        
-        struct ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
-        if (!logits) {
-            error_msg_ = "Failed to find logits tensor";
+
+        struct ggml_tensor * sampled_token = ggml_graph_get_tensor(gf, "sampled_token");
+        if (!sampled_token) {
+            error_msg_ = "Failed to find sampled_token tensor";
             ggml_backend_sched_reset(state_.sched);
             return false;
         }
@@ -3332,11 +3390,10 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        ggml_backend_tensor_get(logits, logits_data.data(), 0, 
-                                 cfg.code_pred_vocab_size * sizeof(float));
-        
-        output[step] = sample_or_argmax(logits_data.data(), cfg.code_pred_vocab_size);
-        
+        int32_t sampled = 0;
+        ggml_backend_tensor_get(sampled_token, &sampled, 0, sizeof(int32_t));
+        output[step] = sampled;
+
         ggml_backend_sched_reset(state_.sched);
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();

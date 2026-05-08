@@ -455,11 +455,33 @@ private:
     // Build computation graph for single-step autoregressive code predictor
     // n_past: number of tokens already in KV cache (0-14)
     // generation_step: which codebook we're predicting (0-14)
-    struct ggml_cgraph * build_code_pred_step_graph(int32_t n_past, int32_t generation_step);
-    
+    // temperature/top_k: when temperature > 0 the cgraph appends an on-GPU
+    //   Gumbel-max sampling chain (input tensor "inp_gumbel" expected,
+    //   shape [top_k] f32). When temperature <= 0 the cgraph appends a
+    //   plain ggml_argmax(logits). The sampled token is exposed as the
+    //   named output tensor "sampled_token" (shape [1] i32).
+    struct ggml_cgraph * build_code_pred_step_graph(int32_t n_past, int32_t generation_step,
+                                                     float temperature, int32_t top_k);
+
     // Build computation graph for 2-token prefill of code predictor
-    // Processes [past_hidden, codec_embd(codebook_0_token)] together
-    struct ggml_cgraph * build_code_pred_prefill_graph();
+    // Processes [past_hidden, codec_embd(codebook_0_token)] together.
+    // Same sampling-chain semantics as build_code_pred_step_graph.
+    struct ggml_cgraph * build_code_pred_prefill_graph(float temperature, int32_t top_k);
+
+    // Append a GPU sampling chain to gf for tensor `logits` (shape [V, 1] f32).
+    // Returns the named "sampled_token" tensor (shape [1] i32).
+    // - temperature <= 0 → ggml_argmax(logits).
+    // - temperature  > 0 → scale(1/T) → top_k → gather → +Gumbel → argmax → gather.
+    //   Caller must register a graph input named `gumbel_input_name` with
+    //   shape [top_k] f32 and tensor_set it before compute. `gumbel_input_name`
+    //   must be unique per cgraph (so per-step in Phase 2's merged cgraph).
+    struct ggml_tensor * append_gpu_sampling(struct ggml_context * ctx,
+                                              struct ggml_cgraph * gf,
+                                              struct ggml_tensor * logits,
+                                              float temperature,
+                                              int32_t top_k,
+                                              const char * gumbel_input_name,
+                                              const char * sampled_output_name);
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);
@@ -505,6 +527,10 @@ private:
     // code-predictor step. They never overlap on the same frame, so one
     // shared buffer is enough; grow on demand, never shrink.
     std::vector<ggml_fp16_t> step_mask_scratch_;
+    // Per-frame Gumbel noise scratch for on-GPU code-pred sampling.
+    // Sized to top_k * 15 (1 prefill + 14 AR steps) and regenerated from rng_
+    // at the top of each predict_codes_autoregressive() call.
+    std::vector<float> code_pred_gumbel_scratch_;
     std::mt19937 rng_{std::random_device{}()};
     CoreMLCodePredictor coreml_code_predictor_;
     bool use_coreml_code_predictor_ = false;
