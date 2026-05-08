@@ -144,13 +144,35 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     gguf_free(ctx);
     if (meta_ctx) ggml_free(meta_ctx);
     
-    state_.backend = init_preferred_backend("TTSTransformer", &error_msg_);
+    // Default-on (v9.3+): request HIGH-priority CUDA streams on the shared
+    // backend, so the talker preempts the dedicated vocoder backend (default
+    // priority) for SM time when both are computing concurrently. CUDA's
+    // least-priority value typically equals the default-create priority
+    // (e.g. 0 on RTX 3060, range = [-5, 0]), so the only way to differentiate
+    // is to bump the talker side UP, not the vocoder side down. Measured at
+    // +0.046 paired RTF (avg 3.974 → 4.020, 95% CI +0.041..+0.052) on the
+    // breakit_seeds corpus / RTX 3060 / Q8 talker / V2 24 kHz vocoder.
+    // First-caller-wins on the shared cache: subsequent shared callers
+    // (encoders, codec_encoder, sync-vocoder) inherit HIGH — fine, none
+    // contend with the dedicated vocoder.
+    // Opt OUT via QWEN3_TTS_TALKER_PRIORITY=default (or "low"/"high" override).
+    const char * talker_priority_env = std::getenv("QWEN3_TTS_TALKER_PRIORITY");
+    const char * talker_priority = (talker_priority_env && talker_priority_env[0] != '\0')
+        ? talker_priority_env
+        : "high";
+    if (std::strcmp(talker_priority, "default") == 0) {
+        talker_priority = nullptr;
+    }
+    state_.backend = init_preferred_backend("TTSTransformer", &error_msg_,
+                                             /*prefer_dedicated=*/ false,
+                                             talker_priority);
     if (!state_.backend) {
         return false;
     }
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
     const char * device_name = device ? ggml_backend_dev_name(device) : "Unknown";
-    fprintf(stderr, "  TTSTransformer backend: %s\n", device_name);
+    fprintf(stderr, "  TTSTransformer backend: %s%s\n", device_name,
+            talker_priority ? (std::string(" (stream priority=") + talker_priority + ")").c_str() : "");
 
     if (device && ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         state_.backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);

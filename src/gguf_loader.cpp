@@ -35,20 +35,31 @@ GGUFLoader::~GGUFLoader() {
 }
 
 static ggml_backend_t init_preferred_backend_uncached(const char * component_name,
-                                                       std::string * error_msg) {
+                                                       std::string * error_msg,
+                                                       const char * backend_priority = nullptr) {
     const char * force_cpu = std::getenv("QWEN3_TTS_FORCE_CPU");
+    // Build "priority=<low|high>" if a priority hint was passed. The
+    // device init parses this; non-CUDA backends ignore the params arg.
+    std::string params_buf;
+    const char * params = nullptr;
+    if (backend_priority && backend_priority[0] != '\0' &&
+        std::strcmp(backend_priority, "default") != 0) {
+        params_buf = "priority=";
+        params_buf += backend_priority;
+        params = params_buf.c_str();
+    }
     ggml_backend_t backend = nullptr;
     if (!(force_cpu && force_cpu[0] == '1')) {
-        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, nullptr);
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU, params);
         if (!backend) {
-            backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
+            backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, params);
         }
         if (!backend) {
-            backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, nullptr);
+            backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, params);
         }
     }
     if (!backend) {
-        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, params);
     }
 
     if (!backend && error_msg) {
@@ -59,16 +70,21 @@ static ggml_backend_t init_preferred_backend_uncached(const char * component_nam
 }
 
 ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg,
-                                      bool prefer_dedicated) {
+                                      bool prefer_dedicated,
+                                      const char * backend_priority) {
     if (error_msg) error_msg->clear();
 
     if (prefer_dedicated) {
         // Skip the shared cache: caller wants its own backend (separate
         // ggml-cuda context + streams). release_preferred_backend's else
         // branch will free the returned backend.
-        return init_preferred_backend_uncached(component_name, error_msg);
+        return init_preferred_backend_uncached(component_name, error_msg, backend_priority);
     }
 
+    // First caller's backend_priority sticks — subsequent shared-cache
+    // callers inherit whatever priority the talker (or whoever inits
+    // first) requested. Documented at the call site so siblings don't
+    // assume their hint will apply.
     std::lock_guard<std::mutex> lock(get_shared_backend_mutex());
 
     auto & shared = get_shared_backend_state();
@@ -77,7 +93,7 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
         return shared.backend;
     }
 
-    ggml_backend_t backend = init_preferred_backend_uncached(component_name, error_msg);
+    ggml_backend_t backend = init_preferred_backend_uncached(component_name, error_msg, backend_priority);
 
     if (backend) {
         shared.backend = backend;
