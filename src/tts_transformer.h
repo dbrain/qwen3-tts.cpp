@@ -7,6 +7,7 @@
 
 #include <string>
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include <memory>
 #include <random>
@@ -244,6 +245,42 @@ struct tts_transformer_state {
     struct ggml_context * suppress_mask_ctx = nullptr;
     ggml_backend_buffer_t suppress_mask_buffer = nullptr;
     struct ggml_tensor *  suppress_mask_tensor = nullptr;
+
+    // v9.7 (stage 1): talker step cgraph cache, keyed by kv_n_eff bucket
+    // (FATTN_KQ_STRIDE=256). Single-entry by design — each cached cgraph
+    // is paired with its OWN gallocr because ggml_gallocr_alloc_graph
+    // can't safely cycle between distinct cgraphs sharing one gallocr:
+    // when a later alloc grows the device buffer the prior cgraph's
+    // tensor->data pointers are not invalidated, and init_tensor
+    // short-circuits on subsequent alloc when tensor->data is non-NULL,
+    // so the prior cgraph keeps the stale offsets and the next compute
+    // segfaults on a cuMemcpyHtoDAsync into freed device memory.
+    // Within a single generate() call, kv_n_eff is monotonic — we visit
+    // each bucket exactly once, ~256 frames apart — so dropping the
+    // single entry at every transition costs only one ggml build + alloc
+    // per ~256 frames (≈ 4 µs/frame amortized). Across requests the
+    // entry persists for short repeats at the same bucket.
+    //
+    // Same single-backend bypass-sched pattern as cp_galloc — the talker
+    // step graph runs entirely on state_.backend (no CPU fallback
+    // nodes), so a one-backend gallocr + direct
+    // ggml_backend_graph_compute is functionally equivalent to sched and
+    // avoids the split/copy mutation that breaks naive cgraph caching.
+    //
+    // Signature (drop the entry on any mismatch): (kv_n_eff, temp_pos,
+    // top_k, rep_pen_active, n_ctx). n_ctx tracks state_.cache.n_ctx;
+    // init/grow_kv_cache change it and re-create the K/V tensor pointers
+    // referenced by the cached cgraph, so invalidation falls out of the
+    // signature check naturally.
+    struct ggml_context * ts_cache_ctx     = nullptr;
+    struct ggml_cgraph  * ts_cache_gf      = nullptr;
+    ggml_gallocr_t        ts_cache_galloc  = nullptr;
+    std::vector<uint8_t>  ts_cache_meta;
+    int32_t ts_cache_kv_n_eff       = 0;
+    bool    ts_cache_temp_pos       = false;
+    int32_t ts_cache_top_k          = 0;
+    bool    ts_cache_rep_pen_active = false;
+    int32_t ts_cache_n_ctx          = 0;
 };
 
 // TTS Transformer class
@@ -505,6 +542,16 @@ private:
     };
     struct ggml_cgraph * build_step_graph(int32_t n_past,
                                           const talker_sampling_params * sampling = nullptr);
+
+    // Variant for the v9.7 step cgraph cache: caller owns ctx + gf so the
+    // cgraph + tensor structs can be kept across frames (one per kv_n_eff
+    // bucket). Same topology as build_step_graph; build_step_graph itself
+    // is a thin wrapper that allocates a throwaway ctx in
+    // state_.compute_meta and calls this.
+    void build_step_graph_into(struct ggml_context * ctx0,
+                                struct ggml_cgraph * gf,
+                                int32_t n_past,
+                                const talker_sampling_params * sampling);
 
     bool project_text_tokens(const int32_t * text_tokens, int32_t n_tokens,
                              std::vector<float> & output);

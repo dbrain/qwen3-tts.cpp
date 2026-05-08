@@ -64,6 +64,21 @@ void TTSTransformer::unload_model() {
         ggml_gallocr_free(state_.cp_galloc);
         state_.cp_galloc = nullptr;
     }
+    if (state_.ts_cache_ctx) {
+        ggml_free(state_.ts_cache_ctx);
+        state_.ts_cache_ctx = nullptr;
+    }
+    state_.ts_cache_gf = nullptr;
+    if (state_.ts_cache_galloc) {
+        ggml_gallocr_free(state_.ts_cache_galloc);
+        state_.ts_cache_galloc = nullptr;
+    }
+    state_.ts_cache_meta.clear();
+    state_.ts_cache_kv_n_eff       = 0;
+    state_.ts_cache_temp_pos       = false;
+    state_.ts_cache_top_k          = 0;
+    state_.ts_cache_rep_pen_active = false;
+    state_.ts_cache_n_ctx          = 0;
     if (state_.suppress_mask_buffer) {
         ggml_backend_buffer_free(state_.suppress_mask_buffer);
         state_.suppress_mask_buffer = nullptr;
@@ -222,6 +237,10 @@ bool TTSTransformer::load_model(const std::string & model_path) {
         error_msg_ = "Failed to allocate code predictor full-AR gallocr";
         return false;
     }
+    // v9.7 (stage 1): the talker step cgraph cache's gallocr is created
+    // lazily on first cache miss, paired 1:1 with the cached cgraph.
+    // (See ts_cache_* comments in the header for the multi-cgraph
+    // gallocr trap that forced this 1:1 layout.)
 
     // v9.5: build the static [codec_vocab_size] f32 suppress mask used by
     // the talker GPU sampling path. Mask shape mirrors the host loop in
@@ -2039,6 +2058,22 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
 
 struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past,
                                                         const talker_sampling_params * sampling) {
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ state_.compute_meta.size(),
+        /*.mem_buffer =*/ state_.compute_meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+    build_step_graph_into(ctx0, gf, n_past, sampling);
+    ggml_free(ctx0);
+    return gf;
+}
+
+void TTSTransformer::build_step_graph_into(struct ggml_context * ctx0,
+                                             struct ggml_cgraph * gf,
+                                             int32_t n_past,
+                                             const talker_sampling_params * sampling) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
@@ -2057,15 +2092,6 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past,
     const int32_t kv_n_eff = std::min(
         state_.cache.n_ctx,
         ((n_past + 1 + kFattnKqStride - 1) / kFattnKqStride) * kFattnKqStride);
-
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ state_.compute_meta.size(),
-        /*.mem_buffer =*/ state_.compute_meta.data(),
-        /*.no_alloc   =*/ true,
-    };
-
-    struct ggml_context * ctx0 = ggml_init(params);
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
 
     struct ggml_tensor * inp_step_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, 1);
     ggml_set_name(inp_step_embd, "inp_step_embd");
@@ -2240,10 +2266,6 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past,
         append_gpu_sampling_view(ctx0, gf, logits_sample, sampling->temperature,
                                   sampling->top_k, gumbel, "sampled_token");
     }
-
-    ggml_free(ctx0);
-
-    return gf;
 }
 
 struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes) {
@@ -3419,16 +3441,105 @@ bool TTSTransformer::forward_step_sample(const float * step_embd, int32_t n_past
     sp.top_k              = top_k;
     sp.repetition_penalty = repetition_penalty;
 
-    struct ggml_cgraph * gf = build_step_graph(n_past, &sp);
+    // v9.7 (stage 1): single-entry talker step cgraph cache. Skips the
+    // per-frame ggml build (~0.2 ms) and, more importantly, stabilizes
+    // gf->nodes pointers within a kv_n_eff bucket so ggml-cuda's
+    // per-compute graph capture reuses across the ~256 frames spent in
+    // each bucket (this was where v9.4's analogous code-pred cache
+    // delivered most of its win). On bucket transition the entry is
+    // dropped + rebuilt — kv_n_eff is monotonic within generate(), so
+    // each bucket is visited exactly once and rebuild cost amortizes to
+    // ~4 µs/frame. See ts_cache_* comments in the header for why we
+    // can't share one gallocr across buckets (init_tensor short-circuit
+    // leaves stale tensor->data when buffer realloc fires).
+    // Same bypass-sched pattern as v9.4's cp_galloc — step cgraph runs
+    // entirely on state_.backend, no CPU fallback. Opt OUT via
+    // QWEN3_TTS_NO_TALKER_STEP_CACHE=1.
+    static const bool s_no_step_cache = std::getenv("QWEN3_TTS_NO_TALKER_STEP_CACHE") != nullptr;
+    const bool use_step_cache = !s_no_step_cache;
+
+    constexpr int32_t kFattnKqStride = 256;
+    const int32_t kv_n_eff = std::min(
+        state_.cache.n_ctx,
+        ((n_past + 1 + kFattnKqStride - 1) / kFattnKqStride) * kFattnKqStride);
+
+    const bool    cur_temp_pos       = temperature > 0.0f;
+    const int32_t cur_top_k          = cur_temp_pos ? top_k : 0;
+    const bool    cur_rep_pen_active = (repetition_penalty != 1.0f);
+    const int32_t cur_n_ctx          = state_.cache.n_ctx;
+
+    auto drop_step_cache = [&]() {
+        if (state_.ts_cache_ctx) {
+            ggml_free(state_.ts_cache_ctx);
+            state_.ts_cache_ctx = nullptr;
+        }
+        state_.ts_cache_gf = nullptr;
+        if (state_.ts_cache_galloc) {
+            ggml_gallocr_free(state_.ts_cache_galloc);
+            state_.ts_cache_galloc = nullptr;
+        }
+        state_.ts_cache_meta.clear();
+    };
+
+    const bool sig_match = use_step_cache &&
+                            state_.ts_cache_gf != nullptr &&
+                            state_.ts_cache_kv_n_eff       == kv_n_eff       &&
+                            state_.ts_cache_temp_pos       == cur_temp_pos   &&
+                            state_.ts_cache_top_k          == cur_top_k      &&
+                            state_.ts_cache_rep_pen_active == cur_rep_pen_active &&
+                            state_.ts_cache_n_ctx          == cur_n_ctx;
+
+    struct ggml_cgraph * gf = nullptr;
+    if (use_step_cache) {
+        if (!sig_match) {
+            drop_step_cache();
+            state_.ts_cache_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead_custom(QWEN3_TTS_MAX_NODES, false));
+            struct ggml_init_params ip = {
+                /*.mem_size   =*/ state_.ts_cache_meta.size(),
+                /*.mem_buffer =*/ state_.ts_cache_meta.data(),
+                /*.no_alloc   =*/ true,
+            };
+            state_.ts_cache_ctx = ggml_init(ip);
+            if (!state_.ts_cache_ctx) {
+                error_msg_ = "Failed to init talker step cgraph context";
+                drop_step_cache();
+                return false;
+            }
+            state_.ts_cache_gf = ggml_new_graph_custom(state_.ts_cache_ctx, QWEN3_TTS_MAX_NODES, false);
+            build_step_graph_into(state_.ts_cache_ctx, state_.ts_cache_gf, n_past, &sp);
+            state_.ts_cache_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(state_.backend));
+            if (!state_.ts_cache_galloc) {
+                error_msg_ = "Failed to allocate talker step gallocr";
+                drop_step_cache();
+                return false;
+            }
+            state_.ts_cache_kv_n_eff       = kv_n_eff;
+            state_.ts_cache_temp_pos       = cur_temp_pos;
+            state_.ts_cache_top_k          = cur_top_k;
+            state_.ts_cache_rep_pen_active = cur_rep_pen_active;
+            state_.ts_cache_n_ctx          = cur_n_ctx;
+        }
+        gf = state_.ts_cache_gf;
+    } else {
+        gf = build_step_graph(n_past, &sp);
+    }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (timing_) timing_->t_talker_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
     t0 = clk::now();
 #endif
 
-    if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
-        error_msg_ = "Failed to allocate talker step+sample graph";
-        return false;
+    if (use_step_cache) {
+        if (!ggml_gallocr_alloc_graph(state_.ts_cache_galloc, gf)) {
+            error_msg_ = "Failed to allocate talker step graph (ts_cache_galloc)";
+            drop_step_cache();
+            return false;
+        }
+    } else {
+        if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
+            error_msg_ = "Failed to allocate talker step+sample graph";
+            return false;
+        }
     }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
@@ -3447,7 +3558,7 @@ bool TTSTransformer::forward_step_sample(const float * step_embd, int32_t n_past
         ggml_backend_tensor_set(inp_pos, &pos, 0, sizeof(int32_t));
     }
     struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
-    const int32_t kv_n_eff = inp_mask ? (int32_t) inp_mask->ne[0] : 0;
+    GGML_ASSERT(!inp_mask || (int32_t) inp_mask->ne[0] == kv_n_eff);
     if ((int32_t) step_mask_scratch_.size() < kv_n_eff) {
         step_mask_scratch_.resize(kv_n_eff);
     }
@@ -3494,9 +3605,13 @@ bool TTSTransformer::forward_step_sample(const float * step_embd, int32_t n_past
     t0 = clk::now();
 #endif
 
-    if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+    const auto compute_status = use_step_cache
+        ? ggml_backend_graph_compute(state_.backend, gf)
+        : ggml_backend_sched_graph_compute(state_.sched, gf);
+    if (compute_status != GGML_STATUS_SUCCESS) {
         error_msg_ = "Failed to compute talker step+sample graph";
-        ggml_backend_sched_reset(state_.sched);
+        if (use_step_cache) drop_step_cache();
+        else                ggml_backend_sched_reset(state_.sched);
         return false;
     }
 #ifdef QWEN3_TTS_TIMING
@@ -3519,7 +3634,7 @@ bool TTSTransformer::forward_step_sample(const float * step_embd, int32_t n_past
     struct ggml_tensor * sampled = ggml_graph_get_tensor(gf, "sampled_token");
     if (!sampled) {
         error_msg_ = "Failed to find sampled_token tensor in talker step+sample graph";
-        ggml_backend_sched_reset(state_.sched);
+        if (!use_step_cache) ggml_backend_sched_reset(state_.sched);
         return false;
     }
     int32_t v = 0;
@@ -3527,7 +3642,7 @@ bool TTSTransformer::forward_step_sample(const float * step_embd, int32_t n_past
     sampled_token_out = v;
 
     state_.cache.n_used = n_past + 1;
-    ggml_backend_sched_reset(state_.sched);
+    if (!use_step_cache) ggml_backend_sched_reset(state_.sched);
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (timing_) timing_->t_talker_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
