@@ -84,8 +84,18 @@ bool load_tensor_data_from_file(
 // conflicts with another component on the same device — e.g. the vocoder
 // in async-dispatch mode while the talker is in CUDA-graph capture mode.
 // release_preferred_backend handles both cached and dedicated backends.
+//
+// backend_priority is a relative CUDA stream priority hint (see
+// ggml_cuda_stream_priority in ggml-cuda.h):
+//   "" / "default" → unchanged
+//   "low"          → least-priority streams (yields SM time to other streams)
+//   "high"         → greatest-priority streams (preempts other streams)
+// Only meaningful with prefer_dedicated=true (the shared cache holds a
+// single backend; mutating its priority across callers is a footgun) and
+// only honored on the CUDA backend; ignored elsewhere.
 ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg,
-                                      bool prefer_dedicated = false);
+                                      bool prefer_dedicated = false,
+                                      const char * backend_priority = nullptr);
 void release_preferred_backend(ggml_backend_t backend);
 
 // Helper function to free model resources

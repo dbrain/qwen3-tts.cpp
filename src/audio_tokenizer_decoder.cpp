@@ -673,13 +673,29 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         // shared backend used pre-v9.1.
         const bool no_async_vocoder = std::getenv("QWEN3_TTS_NO_ASYNC_VOCODER") != nullptr;
         const bool dedicated = !no_async_vocoder;
+        // On a dedicated backend we also drop the streams to LOW priority
+        // so the talker (default-priority) backend gets SM precedence
+        // when both contend for compute. Async vocoder added ~2 ms/frame
+        // contention to the talker/code-pred per the v9.1 audit; LOW
+        // priority on the vocoder side claws that back without changing
+        // talker behavior. No-op on devices with a single priority level.
+        // Opt OUT via QWEN3_TTS_VOCODER_PRIORITY=default (or "high").
+        const char * priority_override = std::getenv("QWEN3_TTS_VOCODER_PRIORITY");
+        const char * backend_priority = nullptr;
+        if (dedicated) {
+            backend_priority = (priority_override && priority_override[0] != '\0')
+                ? priority_override
+                : "low";
+        }
         state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_,
-                                                /*prefer_dedicated=*/ dedicated);
+                                                /*prefer_dedicated=*/ dedicated,
+                                                backend_priority);
         if (!state_.backend) {
             return false;
         }
         if (dedicated) {
-            fprintf(stderr, "  AudioTokenizerDecoder: dedicated backend (async vocoder)\n");
+            fprintf(stderr, "  AudioTokenizerDecoder: dedicated backend (async vocoder, stream priority=%s)\n",
+                    backend_priority ? backend_priority : "default");
         }
     }
 
