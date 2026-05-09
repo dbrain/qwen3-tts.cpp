@@ -1,4 +1,13 @@
-# qwen3-tts.cpp (dbrain fork)
+# qwen3-tts.cpp
+
+> ⚠️ PSAs/TLDRs from the potato that told Claude to make [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp) usable on my hardware
+> - LLM generated noise - I'm a software engineer but I won't pretend to know anything about this space, I just wanted my stuff to run quickerer and when the wins started rolling in framed the goal as "go insane" then "while true; echo 'NOT INSANE ENOUGH, I WANT RTF TO BE AT LEAST.... 3 TIMES AS BIG/SMALL AS THIS!'; done". Current master is the result of the Claudes starting to push back with evidence that we were at the cap. Will ask Mythos if it ever comes out instead of just being pre-shilled around the internet.
+> - Entirely tested and targetted at my hardware (RTX 3060 12GB, AMD misc), may explode on anything else or run slower. Likely any CUDA device would benefit but I'm no nvidiaologist
+> - RTF is backwards, 1/RTF to get the right number. I.E. 1/4.29 == 0.23. I.E. I can generate speech at 4x real time consistently, which seems decent looking at people whinging about how slow qwen3-tts is on much better hardware
+> - I was legitimately getting 0.1 RTF on the upstream fork, i.e. "10" real RTF. I'm sure there was something stupid going on and RTF 0.1 isn't "standard", but the jump from high 1's to low to mid 4's was effort.
+> - "V2 48 kHz vocoder" ended up being clippy - even using the python impl (i.e. not just this project), do not recommend unless you care enough to understand the "why" there.
+> - Q4_K_M is another speed boost and VRAM savings, and TBH I can't decide if it's worse quality or if the numbers are clouding my brain. The pacing of the speech maybe "feels" weird? I guess a bit more uncanny valley than Q8.
+> - TL;DR TL;DR "Works for me, too embarassing to upstream because I'm not going to be 'that guy' who PRs something he does not understand short of laughing at 'megakernel' sticking in claudes brain". Here be dragons.
 
 Self-hosted [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) inference server in C++ via GGML — fork of [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp), itself forked from [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp). Tuned for low-VRAM single-GPU homelab hosting: voice cloning, streaming PCM, persistent voice cache, lazy-load + idle-unload, OpenAI-compatible HTTP API.
 
