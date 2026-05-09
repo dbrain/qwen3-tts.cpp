@@ -1,6 +1,6 @@
 # hbd-qwen3-tts.cpp
 
-> Here be dragons 🐲
+> Here be dragons 🐲  
 > ⚠️ PSAs/TLDRs from the potato that told Claude to make [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp) usable on my hardware
 > - LLM generated noise - I'm a software engineer but I won't pretend to know anything about this space, I just wanted my stuff to run quickerer and when the wins started rolling in framed the goal as "go insane" then "while true; echo 'NOT INSANE ENOUGH, I WANT RTF TO BE AT LEAST.... 3 TIMES AS BIG/SMALL AS THIS!'; done". Current master is the result of the Claudes starting to push back with evidence that we were at the cap. Will ask Mythos if it ever comes out instead of just being pre-shilled around the internet.
 > - Entirely tested and targetted at my hardware (RTX 3060 12GB, AMD misc), may explode on anything else or run slower. Likely any CUDA device would benefit but I'm no nvidiaologist
