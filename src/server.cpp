@@ -11,6 +11,7 @@
 
 #include "qwen3_tts.h"
 #include "audio/ffmpeg_encode.h"
+#include "worker_session.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -384,6 +385,11 @@ struct server_params {
     int         top_k              = 50;
     float       repetition_penalty = 1.05f;
     int64_t     seed               = -1;
+
+    // worker-isolation P1: when set (via "--worker <fd>"), the process
+    // role flips from HTTP server to worker dispatch loop. The fd is the
+    // already-open Unix socketpair end inherited from the parent.
+    int         worker_fd          = -1;
 };
 
 // download a file from a huggingface repo, returns local cache path.
@@ -577,12 +583,18 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "--seed") {
             if (++i >= argc) { fprintf(stderr, "error: missing seed\n"); return false; }
             sp.seed = std::stoll(argv[i]);
+        } else if (arg == "--worker") {
+            // Internal flag — set by spawn_worker() in the parent process.
+            // Don't advertise in --help; users shouldn't need to pass it.
+            if (++i >= argc) { fprintf(stderr, "error: missing worker fd\n"); return false; }
+            sp.worker_fd = std::stoi(argv[i]);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             return false;
         }
     }
-    if (sp.model.empty() && sp.hf_repo.empty()) {
+    // Worker mode doesn't need a model arg (parent passes it via LOAD_REQ).
+    if (sp.worker_fd < 0 && sp.model.empty() && sp.hf_repo.empty()) {
         fprintf(stderr, "error: -m <model> or --hf-repo <repo> is required\n");
         return false;
     }
@@ -634,6 +646,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // worker-isolation P1: when --worker <fd> was passed, this process
+    // is the GPU child. Hand off to the dispatch loop and exit. We
+    // don't return — the loop owns the rest of the process lifetime.
+    if (sp.worker_fd >= 0) {
+        return qwen3_tts::run_worker_loop(sp.worker_fd);
+    }
+
     // resolve --hf-repo to local file paths
     if (!sp.hf_repo.empty()) {
         sp.model = hf_resolve(sp.hf_repo, sp.hf_file);
@@ -661,7 +680,52 @@ int main(int argc, char ** argv) {
     if (const char * env = std::getenv("QWEN3_TTS_LAZY_LOAD")) {
         lazy_load = env[0] && env[0] != '0';
     }
-    if (lazy_load) {
+
+    // worker-isolation P1: when QWEN3_TTS_WORKER_ISOLATION=1 the GPU
+    // work moves to a forked child, leaving this process CUDA-free so
+    // /v1/admin/unload can SIGKILL the worker and reclaim ALL VRAM
+    // (not just the in-process heap buffers). Default off until P5
+    // verifies bench parity vs the in-process path.
+    std::unique_ptr<qwen3_tts::WorkerSession> worker_session;
+    bool worker_iso = false;
+    if (const char * env = std::getenv("QWEN3_TTS_WORKER_ISOLATION")) {
+        worker_iso = env[0] && env[0] != '0';
+    }
+    if (worker_iso) {
+        // Forward CLI args except --worker (set by spawn_worker itself)
+        // so the child sees the same model/threads/etc. options.
+        std::vector<std::string> child_argv;
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--worker" && i + 1 < argc) { i++; continue; }
+            child_argv.push_back(a);
+        }
+        worker_session = std::make_unique<qwen3_tts::WorkerSession>(argv[0], child_argv);
+        fprintf(stderr, "worker-isolation: ENABLED (model loads in subprocess on first request)\n");
+        // The parent process never touches CUDA; lazy_load is implicit.
+        // We still call set_model_paths on the parent's Qwen3TTS so the
+        // voice-archive code paths (which read paths from `tts`) keep
+        // working. Parent's tts.is_loaded() stays false, so the
+        // ensure_loaded() helper below skips the in-process load.
+        tts.set_model_paths(sp.model, sp.vocoder, sp.speaker_encoder);
+        // Eager warm-up of the worker so the first synth doesn't pay the
+        // ~1.2s model-load cost. Skip when LAZY_LOAD=1 — that env explicitly
+        // asks for the deferred-load behaviour.
+        if (!lazy_load) {
+            qwen3_tts::WorkerLoadConfig cfg;
+            cfg.model           = sp.model;
+            cfg.vocoder         = sp.vocoder;
+            cfg.speaker_encoder = sp.speaker_encoder;
+            cfg.lazy_load       = false;
+            if (!worker_session->ensure_loaded(cfg)) {
+                fprintf(stderr, "fatal: worker model load failed: %s\n",
+                        worker_session->last_error().c_str());
+                return 1;
+            }
+            fprintf(stderr, "worker-isolation: worker pid=%d loaded model OK\n",
+                    (int) worker_session->pid());
+        }
+    } else if (lazy_load) {
         tts.set_model_paths(sp.model, sp.vocoder, sp.speaker_encoder);
         fprintf(stderr, "lazy-load: model paths cached, deferring GPU load until first request\n");
     } else {
@@ -849,37 +913,68 @@ int main(int argc, char ** argv) {
     });
 
     // --- GET /health ---
-    svr.Get("/health", [&tts](const httplib::Request &, httplib::Response & res) {
-        json health = {{"status", "ok"}, {"model_loaded", tts.is_loaded()}};
+    svr.Get("/health", [&tts, &worker_session](const httplib::Request &, httplib::Response & res) {
+        const bool loaded = worker_session ? worker_session->is_alive() : tts.is_loaded();
+        json health = {{"status", "ok"}, {"model_loaded", loaded}};
+        if (worker_session) health["worker_pid"] = worker_session->pid();
         res.set_content(health.dump(), "application/json");
     });
 
-    // --- POST /v1/admin/unload --- release model GPU/CPU buffers in-process.
-    // For VRAM management when other workloads need the GPU. Idempotent.
+    // --- POST /v1/admin/unload --- release model GPU/CPU buffers.
+    // In worker-isolation mode this SIGKILLs the worker subprocess →
+    // ALL VRAM (incl. CUDA primary context, cuBLAS workspace, kernel
+    // cache) is reclaimed. In single-process mode, only weight buffers
+    // + KV slabs are freed (the 100-400 MiB CUDA-context residual stays
+    // until the parent exits).
     svr.Post("/v1/admin/unload",
-        [&tts, &synth_mutex](const httplib::Request &, httplib::Response & res) {
+        [&tts, &synth_mutex, &worker_session, &sp](const httplib::Request &, httplib::Response & res) {
         std::lock_guard<std::mutex> lock(synth_mutex);
-        const bool was_loaded = tts.is_loaded();
-        if (was_loaded) tts.unload_model();
-        json out = {{"unloaded", was_loaded}, {"model_loaded", tts.is_loaded()}};
+        bool was_loaded = false;
+        if (worker_session) {
+            was_loaded = worker_session->is_alive();
+            worker_session->shutdown();
+        } else {
+            was_loaded = tts.is_loaded();
+            if (was_loaded) tts.unload_model();
+        }
+        const bool now_loaded = worker_session ? worker_session->is_alive() : tts.is_loaded();
+        json out = {{"unloaded", was_loaded}, {"model_loaded", now_loaded}};
+        if (worker_session) out["mode"] = "worker-isolation";
+        (void) sp; // referenced via worker_session
         res.set_content(out.dump(), "application/json");
     });
 
     // --- POST /v1/admin/load --- reload model files using paths captured
     // by the prior load. No-op if already loaded.
     svr.Post("/v1/admin/load",
-        [&tts, &synth_mutex](const httplib::Request &, httplib::Response & res) {
+        [&tts, &synth_mutex, &worker_session, &sp](const httplib::Request &, httplib::Response & res) {
         std::lock_guard<std::mutex> lock(synth_mutex);
-        const bool was_loaded = tts.is_loaded();
-        bool ok = was_loaded || tts.reload_model();
+        bool was_loaded = false;
+        bool ok = false;
+        std::string err_msg;
+        if (worker_session) {
+            was_loaded = worker_session->is_alive();
+            qwen3_tts::WorkerLoadConfig cfg;
+            cfg.model           = sp.model;
+            cfg.vocoder         = sp.vocoder;
+            cfg.speaker_encoder = sp.speaker_encoder;
+            ok = worker_session->ensure_loaded(cfg);
+            if (!ok) err_msg = worker_session->last_error();
+        } else {
+            was_loaded = tts.is_loaded();
+            ok = was_loaded || tts.reload_model();
+            if (!ok) err_msg = tts.get_error();
+        }
         if (!ok) {
             res.status = 500;
-            json err = {{"error", {{"message", "reload_model failed: " + tts.get_error()},
+            json err = {{"error", {{"message", "load failed: " + err_msg},
                                     {"type", "server_error"}}}};
             res.set_content(err.dump(), "application/json");
             return;
         }
-        json out = {{"loaded", !was_loaded}, {"model_loaded", tts.is_loaded()}};
+        const bool now_loaded = worker_session ? worker_session->is_alive() : tts.is_loaded();
+        json out = {{"loaded", !was_loaded}, {"model_loaded", now_loaded}};
+        if (worker_session) out["mode"] = "worker-isolation";
         res.set_content(out.dump(), "application/json");
     });
 
@@ -1231,7 +1326,7 @@ int main(int argc, char ** argv) {
     svr.Post("/v1/audio/speech",
         [&tts, &synth_mutex, &sp, &voices, &voices_mutex,
          &voice_archive_dir, &model_id, &ensure_loaded_locked,
-         &in_flight_synths, &note_activity](const httplib::Request & req, httplib::Response & res) {
+         &in_flight_synths, &note_activity, &worker_session](const httplib::Request & req, httplib::Response & res) {
 
         // parse request body
         json body;
@@ -1639,27 +1734,56 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        // synthesize (serialized), using voice embedding if provided
+        // synthesize (serialized), using voice embedding if provided.
+        // worker-isolation P1: dispatch via WorkerSession when configured.
+        // The non-streaming path is the only one wired through the worker
+        // for now — live_stream above stays in-process until P2.
         tts_result result;
         {
             InFlightGuard guard(in_flight_synths, note_activity);
             std::lock_guard<std::mutex> lock(synth_mutex);
-            if (!ensure_loaded_locked()) {
-                res.status = 503;
-                json err = {{"error", {{"message", "model reload failed: " + tts.get_error()},
-                                        {"type", "server_error"}}}};
-                res.set_content(err.dump(), "application/json");
-                return;
-            }
-            if (!voice_ref_codes.empty()) {
-                result = tts.synthesize_with_embedding(
-                    input, voice_embedding.data(), (int32_t)voice_embedding.size(), params,
-                    voice_ref_codes.data(), voice_n_ref_frames);
-            } else if (!voice_embedding.empty()) {
-                result = tts.synthesize_with_embedding(
-                    input, voice_embedding.data(), (int32_t)voice_embedding.size(), params);
+            if (worker_session) {
+                qwen3_tts::WorkerLoadConfig cfg;
+                cfg.model           = sp.model;
+                cfg.vocoder         = sp.vocoder;
+                cfg.speaker_encoder = sp.speaker_encoder;
+                if (!worker_session->ensure_loaded(cfg)) {
+                    res.status = 503;
+                    json err = {{"error", {{"message", "worker load failed: "
+                                                + worker_session->last_error()},
+                                            {"type", "server_error"}}}};
+                    res.set_content(err.dump(), "application/json");
+                    return;
+                }
+                if (!voice_ref_codes.empty()) {
+                    result = worker_session->synthesize_with_embedding(
+                        input, voice_embedding.data(), (int32_t) voice_embedding.size(),
+                        params, voice_ref_codes.data(), voice_n_ref_frames);
+                } else if (!voice_embedding.empty()) {
+                    result = worker_session->synthesize_with_embedding(
+                        input, voice_embedding.data(), (int32_t) voice_embedding.size(),
+                        params);
+                } else {
+                    result = worker_session->synthesize(input, params);
+                }
             } else {
-                result = tts.synthesize(input, params);
+                if (!ensure_loaded_locked()) {
+                    res.status = 503;
+                    json err = {{"error", {{"message", "model reload failed: " + tts.get_error()},
+                                            {"type", "server_error"}}}};
+                    res.set_content(err.dump(), "application/json");
+                    return;
+                }
+                if (!voice_ref_codes.empty()) {
+                    result = tts.synthesize_with_embedding(
+                        input, voice_embedding.data(), (int32_t)voice_embedding.size(), params,
+                        voice_ref_codes.data(), voice_n_ref_frames);
+                } else if (!voice_embedding.empty()) {
+                    result = tts.synthesize_with_embedding(
+                        input, voice_embedding.data(), (int32_t)voice_embedding.size(), params);
+                } else {
+                    result = tts.synthesize(input, params);
+                }
             }
         }
 

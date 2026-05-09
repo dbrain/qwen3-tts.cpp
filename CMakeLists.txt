@@ -281,6 +281,7 @@ if(QWEN3_TTS_SERVER)
     add_executable(qwen3-tts-server
         src/server.cpp
         src/worker_ipc.cpp
+        src/worker_session.cpp
         src/audio/ffmpeg_encode.cpp
     )
     target_link_libraries(qwen3-tts-server PRIVATE
