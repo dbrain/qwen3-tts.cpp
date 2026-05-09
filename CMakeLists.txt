@@ -280,6 +280,7 @@ if(QWEN3_TTS_SERVER)
 
     add_executable(qwen3-tts-server
         src/server.cpp
+        src/worker_ipc.cpp
         src/audio/ffmpeg_encode.cpp
     )
     target_link_libraries(qwen3-tts-server PRIVATE
@@ -287,6 +288,18 @@ if(QWEN3_TTS_SERVER)
         httplib::httplib
         nlohmann_json::nlohmann_json
         PkgConfig::LIBAV
+    )
+
+    # Smoke-test for the worker-isolation IPC scaffolding (P1). Fires
+    # spawn_worker → echo PINGs → SHUTDOWN. Doesn't link Qwen3TTS so it
+    # can run on a CUDA-less builder. Built unconditionally with the
+    # server target — paid in a few-100 KB.
+    add_executable(test_worker_ipc
+        src/test_worker_ipc.cpp
+        src/worker_ipc.cpp
+    )
+    target_link_libraries(test_worker_ipc PRIVATE
+        nlohmann_json::nlohmann_json
     )
 endif()
 
