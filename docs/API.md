@@ -90,8 +90,8 @@ Remove the voice from the in-memory map. **Disk artifacts persist** — `voice.b
 | `GET` | `/health` | `{"status":"ok","model_loaded":bool}` |
 | `GET` | `/v1/models` | OpenAI-compat models list |
 | `GET` | `/v1/audio/languages` | language codes the model supports |
-| `POST` | `/v1/admin/load` | re-materialize the model from captured paths (no-op if already loaded) |
-| `POST` | `/v1/admin/unload` | release all GPU/CPU buffers; CUDA-context floor (~370 MiB) does not drop |
+| `POST` | `/v1/admin/load` | re-materialize the model from captured paths (no-op if already loaded). In worker-isolation mode this respawns the worker subprocess. |
+| `POST` | `/v1/admin/unload` | release all GPU/CPU buffers. **Single-process mode**: frees model weights + KV slabs but the ~370 MiB CUDA-context floor stays resident until process exit. **Worker-isolation mode** (`QWEN3_TTS_WORKER_ISOLATION=1`): SIGKILL + waitpid the worker subprocess; the response only returns once the kernel has reaped it, so VRAM is fully reclaimed by the time the HTTP response sends (~80–100 ms wall). |
 
 `POST /v1/admin/{load,unload}` give you explicit control over GPU lifecycle, useful for sharing the GPU with intermittent peers. Otherwise idle-unload via `QWEN3_TTS_IDLE_UNLOAD_SECONDS` does it automatically.
 
@@ -117,6 +117,7 @@ Voice survives across model swaps as long as `model_id` matches. Mismatched bund
 |---|---|---|
 | `QWEN3_TTS_LAZY_LOAD` | unset | `=1` skip startup model load, defer to first request. Voice-archive scan still runs at startup. |
 | `QWEN3_TTS_IDLE_UNLOAD_SECONDS` | unset (off in prod compose; 30 in dev) | release GPU after N seconds of inactivity, lazy-reload on next request |
+| `QWEN3_TTS_WORKER_ISOLATION` | unset | `=1` runs the GPU work in a forked subprocess so `/v1/admin/unload` and the idle-unload watchdog can SIGKILL it and reclaim **all** VRAM (no CUDA-context floor residue). Per-call IPC overhead is sub-noise (~16 µs p99 per AUDIO_FRAME). See [ARCHITECTURE.md#worker-isolation](ARCHITECTURE.md#worker-isolation) for the protocol + cycle-test. |
 | `QWEN3_TTS_VOICE_ARCHIVE_DIR` | `./voice-archive` | where bundles + warmup snapshots persist |
 
 ### Quality / sizing

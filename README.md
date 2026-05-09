@@ -60,7 +60,8 @@ In-process HTTP server (`qwen3-tts-server`), OpenAI-compatible with this fork's 
 Lifecycle env vars worth knowing about:
 
 - `QWEN3_TTS_LAZY_LOAD=1` — boot without touching GPU; first synth triggers materialization (~1 s extra cold-path).
-- `QWEN3_TTS_IDLE_UNLOAD_SECONDS=N` — release model VRAM after `N` seconds of inactivity. Reload is automatic on next request. (~30 s default in dev images. CUDA-context floor of ~370 MiB does not unload.)
+- `QWEN3_TTS_IDLE_UNLOAD_SECONDS=N` — release model VRAM after `N` seconds of inactivity. Reload is automatic on next request (~30 s default in dev images). In single-process mode the ~370 MiB CUDA-context floor stays resident; pair with `QWEN3_TTS_WORKER_ISOLATION=1` to drop to zero.
+- `QWEN3_TTS_WORKER_ISOLATION=1` — fork the GPU work into a subprocess child; `/v1/admin/unload` and the idle-unload watchdog `SIGKILL` the child so the CUDA primary context is torn down by the kernel and **all VRAM is reclaimed**. Parent process never touches CUDA. Per-call IPC overhead is sub-noise (p99 ~16 µs per AUDIO_FRAME). See [docs/ARCHITECTURE.md#worker-isolation](docs/ARCHITECTURE.md#worker-isolation).
 - `QWEN3_TTS_VOICE_ARCHIVE_DIR=/path` — where bundles + warmup snapshots persist.
 - `QWEN3_TTS_KV_Q8=1` (default) — Q8_0 KV cache for the talker, ~64 MiB peak savings, no measurable RTF cost.
 - `QWEN3_TTS_MAX_INPUT_CHARS=6144` (default) — input text cap.
@@ -136,7 +137,7 @@ These are mostly Qwen3-TTS-specific or invasive enough that they don't merge ups
 
 - **Vocoder weights are F16-only on CUDA** — the wmma kernels demand it. Q4 vocoder would force the im2col + cuBLAS path back and tank RTF.
 - **Speaker encoder weights are F16-only** — same reason. Bit-identical to upstream BF16 in practice (ECAPA-TDNN class).
-- **CUDA-context floor (~370 MiB)** doesn't unload mid-process. Idle-unload returns to the floor, not zero.
+- **CUDA-context floor (~370 MiB)** stays resident in single-process mode — `cuMemFree` releases the model but the cuBLAS / kernel-cache / driver state only goes away when the process exits. Set `QWEN3_TTS_WORKER_ISOLATION=1` and the unload-watchdog / `/v1/admin/unload` instead `SIGKILL` a forked child that owns the CUDA context, dropping post-unload VRAM to zero. (Cold respawn on next request adds ~1.2 s.)
 - **Q5_K_M is slower than Q4_K_M on Ampere** via ggml MMQ — practical quant choice is Q4_K_M or Q8_0 only.
 - See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#dead-ends) for things that were tried + measured + ripped out (INT8 mma at M=1, fused-AR, etc.).
 

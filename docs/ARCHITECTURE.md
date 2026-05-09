@@ -155,6 +155,80 @@ Cold-from-disk TTFA <300 ms on the second synth of the same voice. Combined with
 
 ---
 
+## Worker isolation
+
+`/v1/admin/unload` in single-process mode calls `Qwen3TTS::unload_model()` which frees weight buffers, KV slabs, gallocrs, and the ggml-cuda backend. The VMM pool destructor calls `cuMemUnmap` / `cuMemAddressFree` so physical VRAM is released. But the CUDA primary context itself — cuBLAS / cuBLASLt workspaces, compiled cubin/PTX cache (one slab per built arch), driver runtime state — only goes away when the process exits. That's the ~370 MiB residual that survives `/unload`.
+
+`QWEN3_TTS_WORKER_ISOLATION=1` opts into a parent/child split:
+
+```
+parent (qwen3-tts-server)              worker (qwen3-tts-server --worker N)
+─────────────────────────              ────────────────────────────────────
+HTTP server (httplib)
+voice archive on disk
+worker manager
+  ├─ socketpair() ─◄────── socket ─────► reads SYNTH_REQ etc.
+  ├─ fork() ───────────────────────────► owns Qwen3TTS + ggml-cuda
+  └─ /unload → SIGKILL + waitpid         on EOF or SHUTDOWN: exits
+                                         PR_SET_PDEATHSIG: kernel kills
+                                         the worker if parent dies
+```
+
+The parent never touches CUDA, so it never appears in `nvidia-smi`. `/v1/admin/unload` and the idle-unload watchdog both SIGKILL the worker; kernel exit destroys the CUDA primary context; **all VRAM is reclaimed**.
+
+### IPC protocol
+
+Length-prefixed frames over a Unix-domain `socketpair`:
+
+```
+[u32 frame_type][u32 payload_len][u32 req_id][u8 payload[payload_len]]
+```
+
+| frame | dir | payload |
+|---|---|---|
+| `HELLO` | W→P | `{pid, role}` |
+| `LOAD_REQ` / `LOAD_RESP` | both | `{model, vocoder, speaker_encoder, voice_archive_dir, model_id, lazy_load}` → `{ok, error, sample_rate, loaded_warmups}` |
+| `SYNTH_REQ` | P→W | json `{text, params, embedding_size, n_ref_codes, n_ref_frames, stream_batch_size}` + raw f32 embedding + raw i32 ref_codes |
+| `SYNTH_RESP` | W→P | non-streaming: full audio in one frame (json meta + raw f32) |
+| `AUDIO_FRAME` | W→P | streaming: per-chunk PCM (json header + raw f32) |
+| `SYNTH_DONE` | W→P | streaming: end-of-stream metadata (cache keys, sample counts) |
+| `EXTRACT_EMBED_REQ` / `RESP` | both | voice rego: filepath → 1024-float embedding |
+| `ENCODE_CODES_REQ` / `RESP` | both | voice rego: f32 samples → i32 ref_codes + n_frames |
+| `SAVE_WARMUP_REQ` / `RESP` | both | per-synth warmup-blob persistence (worker writes to shared volume) |
+
+`send_frame` coalesces header + payload via `writev` so a single small frame is one kernel send. The standalone POC (in `src/test_worker_ipc.cpp`) measured p99 RTT of 7–24 µs depending on payload (16 KB AUDIO_FRAME = 12 µs p99). At ~75 frames per 6 s synth, IPC overhead amortises to ~0.84 ms vs ~1500 ms wall — sub-noise vs single-process.
+
+### What the worker owns vs what the parent owns
+
+- Parent owns the **voice archive** (filesystem). On voice register the parent decodes the upload, writes the tmpfile, and forwards the path / samples to the worker via `EXTRACT_EMBED_REQ` / `ENCODE_CODES_REQ`. Resulting embedding + ref_codes get persisted to `voice.bundle` by the parent for cross-restart durability.
+- Worker owns the **prefill + ICL warmup caches** in process-local memory. After every successful synth with a non-zero `prefill_cache_key` the parent fires `SAVE_WARMUP_REQ` so the worker can dump `voice.warmup` to the archive volume. On every fresh worker spawn the worker scans `voice_archive_dir` and reloads any `*.warmup` blobs — that's how warmup hits survive `/unload` and idle-unload across worker lifetimes.
+
+### Failure semantics
+
+| event | result |
+|---|---|
+| Worker crashes mid-synth | EOF on socket → parent marks dead, returns 500, next request respawns |
+| HTTP client disconnects mid-stream | parent's `on_pcm` returns false; parent keeps draining frames so worker doesn't back-pressure on a half-consumed stream |
+| Parent SIGKILL'd | kernel sends `SIGTERM` to the worker via `PR_SET_PDEATHSIG`; container restart policy revives the parent |
+| OOM in worker | OOM-kill same as crash |
+
+### Cycle-test
+
+Verified on RTX 3060 / Q8 talker / V1 24 kHz vocoder:
+
+| operation | parent VRAM | worker VRAM | total qwen3-tts.cpp share |
+|---|---:|---:|---:|
+| startup (lazy mode) | 0 | – not spawned | **0 MiB** |
+| first synth | 0 | 2600 MiB | 2600 MiB |
+| 30 s idle → idle-unload | 0 | killed | **0 MiB** |
+| `/v1/admin/unload` | 0 | killed | **0 MiB** (synchronous; ~80–100 ms wall) |
+| respawn after `/unload` | 0 | 2600 MiB | first synth: `voice.warmup` cache HIT from disk |
+| `kill -9` parent | 0 | killed via PDEATHSIG | container restarts cleanly |
+
+Warm-state RTF is 4.25–4.41×, matching the in-process baseline of 4.17× within sampling noise (40-call concurrent stress run had no zombies or leaked VRAM). The IPC POC is in `src/test_worker_ipc.cpp`; the parent-side handle in `src/worker_session.{h,cpp}`; the wire format in `src/worker_ipc.{h,cpp}`.
+
+---
+
 ## Dead ends
 
 Things that were tried, measured, and ripped out — kept here so future agents don't re-derive.
