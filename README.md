@@ -1,5 +1,6 @@
-# qwen3-tts.cpp
+# hbd-qwen3-tts.cpp
 
+> Here be dragons 🐲
 > ⚠️ PSAs/TLDRs from the potato that told Claude to make [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp) usable on my hardware
 > - LLM generated noise - I'm a software engineer but I won't pretend to know anything about this space, I just wanted my stuff to run quickerer and when the wins started rolling in framed the goal as "go insane" then "while true; echo 'NOT INSANE ENOUGH, I WANT RTF TO BE AT LEAST.... 3 TIMES AS BIG/SMALL AS THIS!'; done". Current master is the result of the Claudes starting to push back with evidence that we were at the cap. Will ask Mythos if it ever comes out instead of just being pre-shilled around the internet.
 > - Entirely tested and targetted at my hardware (RTX 3060 12GB, AMD misc), may explode on anything else or run slower. Likely any CUDA device would benefit but I'm no nvidiaologist
@@ -119,7 +120,7 @@ For Q4_K_M (~1 GB lighter VRAM, ~13% faster RTF on Ampere), use [`dbrains/Qwen3-
 ### Native
 
 ```bash
-git clone --recurse-submodules https://github.com/dbrain/qwen3-tts.cpp.git
+git clone --recurse-submodules https://github.com/dbrain/hbd-qwen3-tts.cpp.git
 cd qwen3-tts.cpp
 cmake -S . -B build -G Ninja \
   -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DGGML_CUDA_GRAPHS=ON \
