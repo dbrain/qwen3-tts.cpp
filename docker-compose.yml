@@ -1,0 +1,105 @@
+# Recommended operational setup for qwen3-tts-server.
+#
+# Brings up the server with the lifecycle defaults that hit RTF ~4.2× on
+# Q8 / RTX 3060 with zero VRAM at idle:
+#
+#   - Lazy load: container boots without touching GPU; first synth
+#     materialises the model (~1.2 s extra cold path).
+#   - Idle-unload after 5 min of no requests.
+#   - Worker isolation: GPU work runs in a forked subprocess; idle-unload
+#     and POST /v1/admin/unload SIGKILL it so the CUDA primary context
+#     (cuBLAS workspace + cubin/PTX cache, normally ~370 MiB) is torn
+#     down by the kernel and ALL VRAM is reclaimed. Per-call IPC overhead
+#     is sub-noise (p99 ~16 µs per AUDIO_FRAME).
+#   - V1 24 kHz vocoder (cleaner upper-octave than V2 48 kHz; see
+#     ARCHITECTURE.md note on the V2 hot-band finding).
+#   - 24 MB speaker-encoder sidecar (saves the 2.4 GB Base GGUF download).
+#
+# First-run: HF_TOKEN env var must be set in your shell or .env file
+# (free token at https://huggingface.co/settings/tokens). The first
+# request triggers GGUF auto-download (~1.5 GB Q8 talker + ~280 MB
+# vocoder + ~24 MB sidecar) into the qwen3-tts-models volume.
+#
+# Bring up:
+#   HF_TOKEN=hf_xxxxx docker compose up -d
+#   curl -sf -X POST http://localhost:8000/v1/audio/speech \
+#     -H 'Content-Type: application/json' \
+#     -d '{"input":"Hello world.","voice":"default","response_format":"wav"}' \
+#     -o out.wav
+#
+# Idle behaviour:
+#   docker exec ... nvidia-smi --query-compute-apps=pid,used_memory --format=csv
+#   # after 5 min of no requests: no qwen3-tts-server PID listed.
+
+services:
+  qwen3-tts:
+    build:
+      context: .
+      args:
+        # Trim CUDA arch list to drop the idle CUDA-context VRAM floor
+        # on a single-arch host. Default builds for Turing→Hopper
+        # (75;80;86;89;90). RTX 3000-series = 86, RTX 4000 = 89, etc.
+        QWEN3_TTS_CUDA_ARCHS: "${QWEN3_TTS_CUDA_ARCHS:-75;80;86;89;90}"
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${QWEN3_TTS_PORT:-8000}:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - qwen3-tts-models:/root/.cache/huggingface
+      # Voice clones + warmup snapshots persist here. Survive container
+      # restarts and worker respawns; first request after idle-unload
+      # gets ICL warmup cache HIT in <5 ms.
+      - qwen3-tts-voices:/app/voice-archive
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      HF_TOKEN: ${HF_TOKEN:?HF_TOKEN env var required for first-run downloads}
+
+      # ── Lifecycle ────────────────────────────────────────────────────
+      # Lazy-load: container boots without spiking VRAM. First request
+      # triggers reload (~1.2 s extra on cold path). Pairs with idle-
+      # unload + worker-isolation for the "no GPU at idle" pattern.
+      QWEN3_TTS_LAZY_LOAD: "1"
+      QWEN3_TTS_IDLE_UNLOAD_SECONDS: "300"
+      # Worker isolation: run the GPU work in a forked subprocess so
+      # /v1/admin/unload + idle-unload SIGKILL it, dropping post-unload
+      # VRAM to zero (no CUDA-context residual). See ARCHITECTURE.md.
+      QWEN3_TTS_WORKER_ISOLATION: "1"
+
+      # ── Streaming defaults ───────────────────────────────────────────
+      # first_batch_size=1 keeps TTFA at one codec frame (~35 ms median
+      # on Ampere). Steady-state batch is the binary default of 30.
+      QWEN3_TTS_DEFAULT_STREAM_FIRST_BATCH_SIZE: "1"
+
+      # ── Model selection (override these to swap quants / vocoder) ────
+      # Defaults are set in the Dockerfile ENV: Q8 talker, V1 vocoder,
+      # 24 MB sidecar speaker encoder. Uncomment to override:
+      # QWEN3_TTS_TALKER_REPO:   dbrains/Qwen3-TTS-12Hz-1.7B-VoiceDesign-Q4_K_M-GGUF
+      # QWEN3_TTS_TALKER_QUANT:  Q4_K_M
+      # QWEN3_TTS_VOCODER_REPO:  dbrains/Qwen3-TTS-Tokenizer-12Hz-48kHz-GGUF  # 48 kHz V2
+      # QWEN3_TTS_SE_REPO:       khimaros/Qwen3-TTS-12Hz-1.7B-Base-GGUF       # 2.4 GB Base (alt to sidecar)
+      # QWEN3_TTS_SE_QUANT:      Q8_0
+
+      # ── Performance opt-outs (debug only — defaults are correct) ─────
+      # QWEN3_TTS_KV_Q8: "0"               # F16 K/V (was Q8_0)
+      # QWEN3_TTS_NO_FULL_AR_GRAPH: "1"    # disable v7 full-AR cgraph
+      # QWEN3_TTS_NO_ASYNC_VOCODER: "1"    # vocoder synchronous
+      # QWEN3_TTS_TALKER_PRIORITY: default # disable v9.3 talker=HIGH
+      # GGML_CUDA_DISABLE_GRAPHS: "1"      # disable CUDA-graph capture
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
+
+volumes:
+  qwen3-tts-models:
+  qwen3-tts-voices:

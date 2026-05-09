@@ -87,25 +87,32 @@ Lifecycle env vars worth knowing about:
 
 ### Docker (recommended)
 
+The repo ships a working [`Dockerfile`](Dockerfile) + [`docker-compose.yml`](docker-compose.yml) for the operational pattern that hits RTF ~4.2× on Q8 / RTX 3060 with **zero VRAM at idle** (lazy-load + idle-unload + worker-isolation + V1 vocoder + speaker-encoder sidecar). One command:
+
 ```bash
-docker build \
-  --build-arg QWEN3_TTS_CUDA_ARCHS=86 \
-  -t qwen3-tts.cpp:local .
+HF_TOKEN=hf_xxxxx docker compose up -d
+# (free token: https://huggingface.co/settings/tokens — first run pulls
+# ~1.5 GB Q8 talker + ~280 MB V1 vocoder + ~24 MB SE sidecar to a volume.)
+```
+
+Or roll your own:
+
+```bash
+docker build --build-arg QWEN3_TTS_CUDA_ARCHS=86 -t qwen3-tts.cpp:local .
 
 docker run --gpus all -p 8000:8000 \
   -v qwen3-tts-models:/root/.cache/huggingface \
   -v qwen3-tts-voices:/app/voice-archive \
   -e HF_TOKEN="$HF_TOKEN" \
-  qwen3-tts.cpp:local \
-  --hf-repo    khimaros/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF:Q8_0 \
-  --hf-repo-v  khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF:F16 \
-  --hf-repo-se khimaros/Qwen3-TTS-12Hz-1.7B-Base-GGUF:Q8_0 \
-  -H 0.0.0.0 -p 8000 -j 6
+  -e QWEN3_TTS_LAZY_LOAD=1 \
+  -e QWEN3_TTS_IDLE_UNLOAD_SECONDS=300 \
+  -e QWEN3_TTS_WORKER_ISOLATION=1 \
+  qwen3-tts.cpp:local
 ```
 
-`--hf-repo-se` is the speaker encoder source. The Base GGUF works because the binary only reads its `spk_enc.*` tensors — alternatively use [`dbrains/Qwen3-TTS-12Hz-Speaker-Encoder-GGUF`](https://huggingface.co/dbrains/Qwen3-TTS-12Hz-Speaker-Encoder-GGUF) (~24 MB sidecar, F16) to skip the 2.4 GB Base download.
+The image's `ENTRYPOINT` reads `QWEN3_TTS_TALKER_REPO`, `QWEN3_TTS_VOCODER_REPO`, `QWEN3_TTS_SE_REPO` from env — defaults are the Q8 talker, V1 vocoder, 24 MB SE sidecar ([`dbrains/Qwen3-TTS-12Hz-Speaker-Encoder-GGUF`](https://huggingface.co/dbrains/Qwen3-TTS-12Hz-Speaker-Encoder-GGUF), the binary only reads `spk_enc.*` tensors so the sidecar is enough). To switch quants or use the V2 48 kHz vocoder ([`dbrains/Qwen3-TTS-Tokenizer-12Hz-48kHz-GGUF`](https://huggingface.co/dbrains/Qwen3-TTS-Tokenizer-12Hz-48kHz-GGUF)), override the env (see Dockerfile ENV block + the `docker-compose.yml` overrides section).
 
-For 48 kHz output, swap `--hf-repo-v` to [`dbrains/Qwen3-TTS-Tokenizer-12Hz-48kHz-GGUF:F16`](https://huggingface.co/dbrains/Qwen3-TTS-Tokenizer-12Hz-48kHz-GGUF).
+For Q4_K_M talker (~1 GB lighter VRAM, ~13% faster RTF on Ampere): set `QWEN3_TTS_TALKER_REPO=dbrains/Qwen3-TTS-12Hz-1.7B-VoiceDesign-Q4_K_M-GGUF` + `QWEN3_TTS_TALKER_QUANT=Q4_K_M`.
 
 For Q4_K_M (~1 GB lighter VRAM, ~13% faster RTF on Ampere), use [`dbrains/Qwen3-TTS-12Hz-1.7B-VoiceDesign-Q4_K_M-GGUF:Q4_K_M`](https://huggingface.co/dbrains/Qwen3-TTS-12Hz-1.7B-VoiceDesign-Q4_K_M-GGUF) for `--hf-repo`.
 
