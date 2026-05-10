@@ -911,6 +911,22 @@ int main(int argc, char ** argv) {
     // doesn't change their behavior.
     svr.set_tcp_nodelay(true);
 
+    // cpp-httplib v0.20 only short-circuits DELETE without Content-Length;
+    // POST/PUT/PATCH with no Content-Length and no Transfer-Encoding deadlock
+    // in read_content_without_length until the keep-alive timeout fires (5s)
+    // and the connection drops, returning 400. /v1/admin/{load,unload} are
+    // body-less by design — internal callers (koblem, curl without -d) hit
+    // this constantly. Inject Content-Length: 0 so the body read returns
+    // immediately with len==0.
+    svr.set_pre_routing_handler([](const httplib::Request & req, httplib::Response &) {
+        if ((req.method == "POST" || req.method == "PUT" || req.method == "PATCH") &&
+            !req.has_header("Content-Length") &&
+            req.get_header_value("Transfer-Encoding") != "chunked") {
+            const_cast<httplib::Request &>(req).set_header("Content-Length", "0");
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
     // log all requests
     svr.set_logger([](const httplib::Request & req, const httplib::Response & res) {
         fprintf(stderr, "%s %s%s%s -> %d\n",
