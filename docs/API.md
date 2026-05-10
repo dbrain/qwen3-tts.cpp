@@ -82,6 +82,14 @@ On success: `voice.bundle` written to `$QWEN3_TTS_VOICE_ARCHIVE_DIR/<name>/`. Re
 
 If a `voice.bundle` already exists for this name + current model, the encoder forward passes are skipped — you can re-register a clone in <50 ms.
 
+## `GET /v1/audio/voices/{name}/sample.wav`
+
+Returns the original `ref.wav` written when the clone was registered (mono PCM WAV, the bytes the caller submitted as `audio_sample`). For replay / re-upload / debug only — synthesis runs from the bundle's embedding + ref_codes, not this file. `404` when `QWEN3_TTS_VOICE_ARCHIVE_DIR` is unset or the file isn't on disk (e.g. clone was registered before the archive dir existed, or the file was hand-deleted).
+
+## `GET /v1/audio/voices/{name}/ref_text`
+
+Returns the `ref_text.txt` content. `text/plain; charset=utf-8` by default, or `application/json` (`{"ref_text": "..."}`) when the request carries `Accept: application/json`. `404` when no `ref_text` was provided at register time.
+
 ## `DELETE /v1/audio/voices/{name}`
 
 Remove the voice from the in-memory map. **Disk artifacts persist** — `voice.bundle` and `voice.warmup` stay in the archive volume so a re-register or a process restart picks them back up. To truly purge, also `rm -rf` the directory under `$QWEN3_TTS_VOICE_ARCHIVE_DIR/<name>/`.

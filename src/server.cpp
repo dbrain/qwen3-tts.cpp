@@ -26,6 +26,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1380,6 +1381,79 @@ int main(int argc, char ** argv) {
             res.status = 404;
             res.set_content(R"({"error":{"message":"voice not found","type":"not_found"}})",
                             "application/json");
+        }
+    });
+
+    // --- GET /v1/audio/voices/:id/sample.wav ---
+    // Returns the original ref.wav written at register time. Does not
+    // re-synthesise — this is the user's own clip. 404 when archive disabled
+    // or the file isn't on disk (e.g. voice was registered before the archive
+    // dir was set, or the file was hand-deleted).
+    svr.Get(R"(/v1/audio/voices/([^/]+)/sample\.wav)",
+        [&voice_archive_dir](const httplib::Request & req, httplib::Response & res) {
+        std::string voice_id = req.matches[1];
+        if (!is_safe_voice_name(voice_id)) {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"invalid voice id","type":"invalid_request_error"}})",
+                            "application/json");
+            return;
+        }
+        const std::string voice_dir = voice_dir_path(voice_archive_dir, voice_id);
+        if (voice_dir.empty()) {
+            res.status = 404;
+            res.set_content(R"({"error":{"message":"voice archive not configured","type":"not_found"}})",
+                            "application/json");
+            return;
+        }
+        const std::string sample_path = voice_dir + "/ref.wav";
+        std::ifstream f(sample_path, std::ios::binary);
+        if (!f) {
+            res.status = 404;
+            res.set_content(R"({"error":{"message":"sample.wav not on disk","type":"not_found"}})",
+                            "application/json");
+            return;
+        }
+        std::ostringstream oss;
+        oss << f.rdbuf();
+        res.set_content(oss.str(), "audio/wav");
+    });
+
+    // --- GET /v1/audio/voices/:id/ref_text ---
+    // Returns the optional ICL ref_text.txt as text/plain. 404 when the
+    // voice was registered without a ref_text. Use Accept: application/json
+    // to get the same content wrapped as `{"ref_text": "..."}`.
+    svr.Get(R"(/v1/audio/voices/([^/]+)/ref_text)",
+        [&voice_archive_dir](const httplib::Request & req, httplib::Response & res) {
+        std::string voice_id = req.matches[1];
+        if (!is_safe_voice_name(voice_id)) {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"invalid voice id","type":"invalid_request_error"}})",
+                            "application/json");
+            return;
+        }
+        const std::string voice_dir = voice_dir_path(voice_archive_dir, voice_id);
+        if (voice_dir.empty()) {
+            res.status = 404;
+            res.set_content(R"({"error":{"message":"voice archive not configured","type":"not_found"}})",
+                            "application/json");
+            return;
+        }
+        const std::string text_path = voice_dir + "/ref_text.txt";
+        std::ifstream f(text_path);
+        if (!f) {
+            res.status = 404;
+            res.set_content(R"({"error":{"message":"ref_text not on disk","type":"not_found"}})",
+                            "application/json");
+            return;
+        }
+        std::ostringstream oss;
+        oss << f.rdbuf();
+        const std::string body = oss.str();
+        const std::string accept = req.get_header_value("Accept");
+        if (accept.find("application/json") != std::string::npos) {
+            res.set_content(json({{"ref_text", body}}).dump(), "application/json");
+        } else {
+            res.set_content(body, "text/plain; charset=utf-8");
         }
     });
 
