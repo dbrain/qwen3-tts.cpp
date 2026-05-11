@@ -151,11 +151,24 @@ ENV QWEN3_TTS_TALKER_REPO=khimaros/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF \
     QWEN3_TTS_SE_REPO=dbrains/Qwen3-TTS-12Hz-Speaker-Encoder-GGUF \
     QWEN3_TTS_SE_QUANT=F16
 
+# Forced aligner (opt-in). Empty FA_REPO disables `align=true` requests
+# with a 400. When set, the worker lazy-loads ~530 MB (Q4_K) on first
+# align request and keeps the model resident until idle-unload kills the
+# worker. The aligner is a Qwen3 0.6B variant with a 5000-class lm_head
+# predicting 80 ms-resolution timestamp classes — same architecture as
+# qwen3-asr, different head.
+ENV QWEN3_TTS_FA_REPO= \
+    QWEN3_TTS_FA_QUANT=Q4_K
+
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s \
     CMD curl -sf http://localhost:8000/health || exit 1
 
+# Aligner CLI flag only added when QWEN3_TTS_FA_REPO is non-empty — leave
+# it off the command line entirely in the default-off case so the server
+# doesn't try to resolve an empty repo spec.
 ENTRYPOINT ["/bin/sh", "-c", "exec /usr/local/bin/qwen3-tts-server \
     --hf-repo    \"${QWEN3_TTS_TALKER_REPO}:${QWEN3_TTS_TALKER_QUANT}\" \
     --hf-repo-v  \"${QWEN3_TTS_VOCODER_REPO}:${QWEN3_TTS_VOCODER_QUANT}\" \
     --hf-repo-se \"${QWEN3_TTS_SE_REPO}:${QWEN3_TTS_SE_QUANT}\" \
+    ${QWEN3_TTS_FA_REPO:+--hf-repo-fa \"${QWEN3_TTS_FA_REPO}:${QWEN3_TTS_FA_QUANT}\"} \
     -H 0.0.0.0 -p 8000 -j \"$(nproc)\" ${QWEN3_TTS_EXTRA_ARGS:-}"]

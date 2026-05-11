@@ -358,6 +358,31 @@ static std::string build_done_event(const tts_result & result) {
     return ev.dump();
 }
 
+// Whitespace-split a UTF-8 string into word tokens for forced alignment.
+// Runs of ASCII whitespace (space / tab / newline) are skipped; any non-
+// whitespace byte sequence is one word. Multi-byte UTF-8 bytes (>=128)
+// pass through unchanged — the aligner's BPE tokenizer is byte-level so
+// it handles diacritics/punctuation/emoji correctly without pre-cleaning.
+//
+// CJK pre-tokenization (Chinese/Japanese characters as one-word-each)
+// is out of scope for v1 English — flagged as a follow-up in the
+// vendored qwen3_asr_align_words doc-comment.
+static std::vector<std::string> whitespace_split_for_align(const std::string & text) {
+    std::vector<std::string> out;
+    size_t i = 0, n = text.size();
+    while (i < n) {
+        while (i < n && (text[i] == ' ' || text[i] == '\t' ||
+                         text[i] == '\n' || text[i] == '\r')) i++;
+        if (i >= n) break;
+        size_t j = i;
+        while (j < n && text[j] != ' ' && text[j] != '\t' &&
+               text[j] != '\n' && text[j] != '\r') j++;
+        out.emplace_back(text.substr(i, j - i));
+        i = j;
+    }
+    return out;
+}
+
 // in-memory custom voice store
 struct custom_voice {
     std::string name;
@@ -378,6 +403,13 @@ struct server_params {
     std::string hf_file_v;   // override filename within --hf-repo-v
     std::string hf_repo_se;  // speaker-encoder HF repo (separate GGUF; used when -m is VoiceDesign)
     std::string hf_file_se;  // override filename within --hf-repo-se
+    // Forced-aligner GGUF for /v1/audio/speech?align=true. Empty disables
+    // the feature: ALIGN_REQ returns "aligner_model not configured". The
+    // worker loads this lazily on first align request — zero VRAM cost
+    // for callers who never opt in.
+    std::string aligner_model;
+    std::string hf_repo_fa;   // forced-aligner HF repo (e.g. "cstr/qwen3-forced-aligner-0.6b-GGUF:Q4_K")
+    std::string hf_file_fa;   // override filename within --hf-repo-fa
     std::string host      = "127.0.0.1";
     int         port      = 8080;
     int         n_threads = 4;
@@ -391,6 +423,10 @@ struct server_params {
     // role flips from HTTP server to worker dispatch loop. The fd is the
     // already-open Unix socketpair end inherited from the parent.
     int         worker_fd          = -1;
+    // Phase-2 streaming alignment: when set (via "--worker-aligner <fd>"),
+    // the process runs the aligner-only dispatch loop (FA model only, no
+    // talker / vocoder / spk-encoder). Set by parent's spawn_worker.
+    int         aligner_worker_fd  = -1;
 };
 
 // download a file from a huggingface repo, returns local cache path.
@@ -517,6 +553,9 @@ static void print_usage(const char * program) {
     fprintf(stderr, "       --hf-file-v <file>          override GGUF filename within --hf-repo-v\n");
     fprintf(stderr, "       --hf-repo-se <repo[:quant]> HuggingFace speaker-encoder repo (separate GGUF)\n");
     fprintf(stderr, "       --hf-file-se <file>         override GGUF filename within --hf-repo-se\n");
+    fprintf(stderr, "       --aligner-model <file>      optional forced-aligner GGUF (e.g. qwen3-forced-aligner-0.6b-q4_k.gguf)\n");
+    fprintf(stderr, "       --hf-repo-fa <repo[:quant]> HuggingFace forced-aligner repo (default quant: Q4_K)\n");
+    fprintf(stderr, "       --hf-file-fa <file>         override GGUF filename within --hf-repo-fa\n");
     fprintf(stderr, "  -H,  --host <host>              listen host (default: 127.0.0.1)\n");
     fprintf(stderr, "  -p,  --port <port>              listen port (default: 8080)\n");
     fprintf(stderr, "  -j,  --threads <n>              compute threads (default: 4)\n");
@@ -572,6 +611,15 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "--hf-file-se") {
             if (++i >= argc) { fprintf(stderr, "error: missing hf speaker-encoder file\n"); return false; }
             sp.hf_file_se = argv[i];
+        } else if (arg == "--aligner-model") {
+            if (++i >= argc) { fprintf(stderr, "error: missing aligner-model path\n"); return false; }
+            sp.aligner_model = argv[i];
+        } else if (arg == "--hf-repo-fa") {
+            if (++i >= argc) { fprintf(stderr, "error: missing hf forced-aligner repo\n"); return false; }
+            sp.hf_repo_fa = argv[i];
+        } else if (arg == "--hf-file-fa") {
+            if (++i >= argc) { fprintf(stderr, "error: missing hf forced-aligner file\n"); return false; }
+            sp.hf_file_fa = argv[i];
         } else if (arg == "--temperature") {
             if (++i >= argc) { fprintf(stderr, "error: missing temperature\n"); return false; }
             sp.temperature = std::stof(argv[i]);
@@ -589,13 +637,17 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
             // Don't advertise in --help; users shouldn't need to pass it.
             if (++i >= argc) { fprintf(stderr, "error: missing worker fd\n"); return false; }
             sp.worker_fd = std::stoi(argv[i]);
+        } else if (arg == "--worker-aligner") {
+            // Internal flag — Phase 2 streaming-alignment sibling worker.
+            if (++i >= argc) { fprintf(stderr, "error: missing aligner-worker fd\n"); return false; }
+            sp.aligner_worker_fd = std::stoi(argv[i]);
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             return false;
         }
     }
     // Worker mode doesn't need a model arg (parent passes it via LOAD_REQ).
-    if (sp.worker_fd < 0 && sp.model.empty() && sp.hf_repo.empty()) {
+    if (sp.worker_fd < 0 && sp.aligner_worker_fd < 0 && sp.model.empty() && sp.hf_repo.empty()) {
         fprintf(stderr, "error: -m <model> or --hf-repo <repo> is required\n");
         return false;
     }
@@ -653,6 +705,9 @@ int main(int argc, char ** argv) {
     if (sp.worker_fd >= 0) {
         return qwen3_tts::run_worker_loop(sp.worker_fd);
     }
+    if (sp.aligner_worker_fd >= 0) {
+        return qwen3_tts::run_aligner_worker_loop(sp.aligner_worker_fd);
+    }
 
     // resolve --hf-repo to local file paths
     if (!sp.hf_repo.empty()) {
@@ -669,6 +724,11 @@ int main(int argc, char ** argv) {
         sp.speaker_encoder = hf_resolve(sp.hf_repo_se, sp.hf_file_se);
         if (sp.speaker_encoder.empty()) return 1;
         fprintf(stderr, "resolved speaker-encoder: %s\n", sp.speaker_encoder.c_str());
+    }
+    if (!sp.hf_repo_fa.empty()) {
+        sp.aligner_model = hf_resolve(sp.hf_repo_fa, sp.hf_file_fa, "Q4_K");
+        if (sp.aligner_model.empty()) return 1;
+        fprintf(stderr, "resolved forced-aligner: %s\n", sp.aligner_model.c_str());
     }
 
     // load models. With QWEN3_TTS_LAZY_LOAD=1 the server starts with no
@@ -688,6 +748,13 @@ int main(int argc, char ** argv) {
     // (not just the in-process heap buffers). Default off until P5
     // verifies bench parity vs the in-process path.
     std::unique_ptr<qwen3_tts::WorkerSession> worker_session;
+    // Phase-2 streaming alignment: aligner-only sibling subprocess. Lazy-
+    // spawned on first /v1/audio/speech request with align_stream=partial.
+    // Sharing the same `aligner_only=true` WorkerSession instance avoids
+    // per-paragraph fork+exec + FA cold-load — model lives in VRAM across
+    // paragraphs (idle-unload reclaims after inactivity, same as main).
+    std::unique_ptr<qwen3_tts::WorkerSession> aligner_session;
+    std::mutex aligner_session_mutex; // serialises spawn + cross-paragraph use
     bool worker_iso = false;
     if (const char * env = std::getenv("QWEN3_TTS_WORKER_ISOLATION")) {
         worker_iso = env[0] && env[0] != '0';
@@ -699,9 +766,14 @@ int main(int argc, char ** argv) {
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "--worker" && i + 1 < argc) { i++; continue; }
+            if (a == "--worker-aligner" && i + 1 < argc) { i++; continue; }
             child_argv.push_back(a);
         }
         worker_session = std::make_unique<qwen3_tts::WorkerSession>(argv[0], child_argv);
+        // Aligner sibling reuses the same child_argv (it ignores model /
+        // vocoder / spk_enc); --hf-repo-fa propagates through LOAD_REQ.
+        aligner_session = std::make_unique<qwen3_tts::WorkerSession>(
+            argv[0], child_argv, /*aligner_only=*/true);
         fprintf(stderr, "worker-isolation: ENABLED (model loads in subprocess on first request)\n");
         // The parent process never touches CUDA; lazy_load is implicit.
         // We still call set_model_paths on the parent's Qwen3TTS so the
@@ -837,7 +909,20 @@ int main(int argc, char ** argv) {
         cfg.speaker_encoder    = sp.speaker_encoder;
         cfg.voice_archive_dir  = voice_archive_dir;
         cfg.model_id           = model_id;
+        cfg.aligner_model      = sp.aligner_model;
         cfg.lazy_load          = false;
+        return cfg;
+    };
+
+    // Aligner-only sibling worker config: just the FA GGUF path. The
+    // aligner subprocess's run_aligner_worker_loop ignores model /
+    // vocoder / spk_enc anyway, but keeping them empty makes intent
+    // explicit and helps the cache-hit check in ensure_loaded.
+    auto make_aligner_cfg = [&]() {
+        qwen3_tts::WorkerLoadConfig cfg;
+        cfg.aligner_model      = sp.aligner_model;
+        cfg.lazy_load          = true; // run_aligner_worker_loop does its own lazy
+        cfg.aligner_only       = true;
         return cfg;
     };
 
@@ -960,7 +1045,8 @@ int main(int argc, char ** argv) {
     // + KV slabs are freed (the 100-400 MiB CUDA-context residual stays
     // until the parent exits).
     svr.Post("/v1/admin/unload",
-        [&tts, &synth_mutex, &worker_session, &sp](const httplib::Request &, httplib::Response & res) {
+        [&tts, &synth_mutex, &worker_session, &aligner_session, &aligner_session_mutex, &sp](
+            const httplib::Request &, httplib::Response & res) {
         std::lock_guard<std::mutex> lock(synth_mutex);
         bool was_loaded = false;
         if (worker_session) {
@@ -970,8 +1056,18 @@ int main(int argc, char ** argv) {
             was_loaded = tts.is_loaded();
             if (was_loaded) tts.unload_model();
         }
+        // Also tear down the aligner sibling — otherwise it keeps ~730 MiB
+        // of GPU resident across an admin/unload. Take its mutex too so an
+        // in-flight streaming-align paragraph isn't SIGKILL'd mid-pass.
+        bool aligner_was_alive = false;
+        if (aligner_session) {
+            std::lock_guard<std::mutex> alock(aligner_session_mutex);
+            aligner_was_alive = aligner_session->is_alive();
+            if (aligner_was_alive) aligner_session->shutdown();
+        }
         const bool now_loaded = worker_session ? worker_session->is_alive() : tts.is_loaded();
-        json out = {{"unloaded", was_loaded}, {"model_loaded", now_loaded}};
+        json out = {{"unloaded", was_loaded || aligner_was_alive}, {"model_loaded", now_loaded}};
+        if (aligner_was_alive) out["aligner_unloaded"] = true;
         if (worker_session) out["mode"] = "worker-isolation";
         (void) sp; // referenced via worker_session
         res.set_content(out.dump(), "application/json");
@@ -1462,7 +1558,9 @@ int main(int argc, char ** argv) {
         [&tts, &synth_mutex, &sp, &voices, &voices_mutex,
          &voice_archive_dir, &model_id, &ensure_loaded_locked,
          &in_flight_synths, &note_activity, &worker_session,
-         &make_worker_cfg](const httplib::Request & req, httplib::Response & res) {
+         &make_worker_cfg,
+         &aligner_session, &aligner_session_mutex,
+         &make_aligner_cfg](const httplib::Request & req, httplib::Response & res) {
 
         // parse request body
         json body;
@@ -1520,6 +1618,25 @@ int main(int argc, char ** argv) {
         std::string voice           = body.value("voice", "");
         std::string instructions    = body.value("instructions", "");
         std::string language        = body.value("language", "en");
+        // Forced-alignment opt-in. When true the server runs the qwen3-fa
+        // model against the synthesised audio after streaming and emits a
+        // `speech.audio.alignment` SSE event with per-word timings. Adds
+        // ~few-hundred ms to the tail of the response (one cold-load on
+        // first request) and pulls ~530 MB of VRAM into the worker for
+        // the lifetime of the worker. v1 requires stream_format=sse +
+        // worker isolation (the aligner lives in the worker and reads
+        // the worker's cached PCM, so the in-process path can't serve it
+        // without re-piping the audio back across the IPC boundary).
+        bool        do_align        = body.value("align", false);
+        // Phase-2 streaming-alignment opt-in. "final-only" (default) is the
+        // existing single-shot behaviour — one speech.audio.alignment event
+        // after the last audio chunk. "partial" sends interim
+        // speech.audio.alignment.partial events as audio is generated, plus
+        // a final speech.audio.alignment.final event when synth completes.
+        // Requires stream_format=sse + worker isolation (we route the
+        // alignment to an aligner-only sibling subprocess).
+        std::string align_stream      = body.value("align_stream", std::string("final-only"));
+        const bool  do_align_partial  = do_align && (align_stream == "partial");
         float       temperature     = body.value("temperature", sp.temperature);
         int         top_k           = body.value("top_k", sp.top_k);
         float       top_p           = body.value("top_p", 1.0f);
@@ -1646,6 +1763,52 @@ int main(int argc, char ** argv) {
             return;
         }
 
+        // validate alignment opt-in. v1 requires both worker-isolation (the
+        // aligner runs in the worker) and stream_format=sse (the alignment
+        // event piggybacks on the SSE stream right before speech.audio.done).
+        // Non-sse callers get a clear 400 instead of a silent no-op.
+        if (do_align) {
+            if (!worker_session) {
+                res.status = 400;
+                json err = {{"error", {
+                    {"message", "align=true requires worker isolation; "
+                                "start the server with QWEN3_TTS_WORKER_ISOLATION=1"},
+                    {"type", "invalid_request_error"},
+                }}};
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            if (stream_format != "sse") {
+                res.status = 400;
+                json err = {{"error", {
+                    {"message", "align=true requires stream_format=\"sse\" "
+                                "(alignment is delivered as a speech.audio.alignment SSE event)"},
+                    {"type", "invalid_request_error"},
+                }}};
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            if (align_stream != "final-only" && align_stream != "partial") {
+                res.status = 400;
+                json err = {{"error", {
+                    {"message", "align_stream must be \"final-only\" (default) or \"partial\""},
+                    {"type", "invalid_request_error"},
+                }}};
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+            if (align_stream == "partial" && !aligner_session) {
+                res.status = 400;
+                json err = {{"error", {
+                    {"message", "align_stream=\"partial\" requires an aligner-only sibling worker; "
+                                "rebuild with worker isolation enabled (QWEN3_TTS_WORKER_ISOLATION=1)"},
+                    {"type", "invalid_request_error"},
+                }}};
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+        }
+
         // resolve voice to speaker embedding (and optional ICL data)
         std::vector<float> voice_embedding;
         std::string voice_ref_text;
@@ -1739,13 +1902,15 @@ int main(int argc, char ** argv) {
                  voice_ref_codes = std::move(voice_ref_codes),
                  voice_n_ref_frames,
                  stream_batch_size, stream_first_batch_size, is_sse, is_wav,
-                 is_compressed, compressed_codec, bitrate_kbps,
+                 is_compressed, compressed_codec, bitrate_kbps, do_align,
+                 do_align_partial,
                  synth_mutex = &synth_mutex,
                  voice = voice, warmup_path = warmup_path, model_id = model_id,
                  in_flight = &in_flight_synths,
                  &note_activity,
                  &ensure_loaded_locked,
-                 &worker_session, &make_worker_cfg]
+                 &worker_session, &make_worker_cfg,
+                 &aligner_session, &aligner_session_mutex, &make_aligner_cfg]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     // Guard the in-flight counter for the entire synth so
                     // idle-unload doesn't release the model out from under
@@ -1796,11 +1961,18 @@ int main(int argc, char ** argv) {
                         header_written = true;
                     };
 
+                    // SSE writes happen from two places under align_stream=
+                    // partial — on_pcm (main thread) and the partial-align
+                    // reader thread. Serialise so audio.delta and
+                    // alignment.partial events interleave cleanly.
+                    std::mutex sink_write_mutex;
+
                     // Single bytes-out path — wraps base64 + SSE framing for
                     // sse mode, raw write for chunked-audio. Same call site
                     // for pcm / wav / mp3 / ogg bytes.
                     auto emit_bytes = [&](const char * data, size_t len) -> bool {
                         if (len == 0) return true;
+                        std::lock_guard<std::mutex> wlock(sink_write_mutex);
                         if (is_sse) {
                             json delta = {
                                 {"type", "speech.audio.delta"},
@@ -1813,19 +1985,105 @@ int main(int argc, char ** argv) {
                         return sink.write(data, len);
                     };
 
+                    // ── Phase-2 streaming alignment setup ────────────────
+                    // Ensure aligner sibling is alive + loaded, begin the
+                    // session with the whitespace-split words. The reader
+                    // thread polls drain_partial_alignments and emits
+                    // speech.audio.alignment.partial events as they come.
+                    std::vector<std::string> partial_align_words;
+                    std::thread partial_reader_thread;
+                    std::atomic<bool> partial_reader_stop{false};
+                    std::atomic<int64_t> audio_offset_ms{0};
+                    std::atomic<int>     partial_event_count{0};
+                    bool partial_align_active = false;
+                    std::unique_lock<std::mutex> aligner_lock; // held for the full request
+                    if (do_align_partial && aligner_session) {
+                        aligner_lock = std::unique_lock<std::mutex>(aligner_session_mutex);
+                        if (!aligner_session->ensure_loaded(make_aligner_cfg())) {
+                            json ev = {{"type", "speech.audio.alignment.error"},
+                                       {"error", std::string("aligner ensure_loaded failed: ")
+                                                 + aligner_session->last_error()}};
+                            std::lock_guard<std::mutex> wlock(sink_write_mutex);
+                            std::string af = "event: speech.audio.alignment.error\ndata: "
+                                           + ev.dump() + "\n\n";
+                            sink.write(af.data(), af.size());
+                            // Fall through — we'll keep synthesising even if
+                            // alignment plumbing failed; client gets audio
+                            // without partial events.
+                            aligner_lock.unlock();
+                        } else {
+                            partial_align_words = whitespace_split_for_align(input);
+                            if (!aligner_session->begin_streaming_align(partial_align_words, wav_sample_rate)) {
+                                json ev = {{"type", "speech.audio.alignment.error"},
+                                           {"error", std::string("begin_streaming_align failed: ")
+                                                     + aligner_session->last_error()}};
+                                std::lock_guard<std::mutex> wlock(sink_write_mutex);
+                                std::string af = "event: speech.audio.alignment.error\ndata: "
+                                               + ev.dump() + "\n\n";
+                                sink.write(af.data(), af.size());
+                                aligner_lock.unlock();
+                            } else {
+                                partial_align_active = true;
+                                partial_reader_thread = std::thread([&]() {
+                                    while (!partial_reader_stop.load(std::memory_order_relaxed)) {
+                                        bool ok = aligner_session->drain_partial_alignments(
+                                            [&](int64_t audio_seen_ms,
+                                                const std::vector<qwen3_tts::AlignedWord> & words) {
+                                                json wj = json::array();
+                                                for (size_t i = 0; i < words.size(); i++) {
+                                                    wj.push_back({
+                                                        {"word_index", (int) i},
+                                                        {"text",       words[i].text},
+                                                        {"t0_ms",      words[i].t0_ms},
+                                                        {"t1_ms",      words[i].t1_ms},
+                                                    });
+                                                }
+                                                json ev = {
+                                                    {"type",          "speech.audio.alignment.partial"},
+                                                    {"audio_seen_ms", audio_seen_ms},
+                                                    {"words",         std::move(wj)},
+                                                };
+                                                std::lock_guard<std::mutex> wlock(sink_write_mutex);
+                                                std::string af = "event: speech.audio.alignment.partial\ndata: "
+                                                               + ev.dump() + "\n\n";
+                                                sink.write(af.data(), af.size());
+                                                partial_event_count.fetch_add(1, std::memory_order_relaxed);
+                                            });
+                                        (void) ok;
+                                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                    }
+                                });
+                            }
+                        }
+                    }
+
                     streaming_opts sopts;
                     sopts.batch_size = stream_batch_size;
                     sopts.first_batch_size = stream_first_batch_size;
                     sopts.on_pcm = [&](const float * pcm, size_t n) -> bool {
                         ensure_header();
+                        bool ok = true;
                         if (is_compressed) {
                             std::vector<uint8_t> encoded;
                             if (!enc->push_pcm(pcm, n, encoded)) return false;
-                            return emit_bytes(reinterpret_cast<const char *>(encoded.data()),
-                                              encoded.size());
+                            ok = emit_bytes(reinterpret_cast<const char *>(encoded.data()),
+                                            encoded.size());
+                        } else {
+                            std::string bytes = encode_pcm(std::vector<float>(pcm, pcm + n));
+                            ok = emit_bytes(bytes.data(), bytes.size());
                         }
-                        std::string bytes = encode_pcm(std::vector<float>(pcm, pcm + n));
-                        return emit_bytes(bytes.data(), bytes.size());
+                        if (partial_align_active && wav_sample_rate > 0) {
+                            const int64_t this_chunk_ms = (int64_t) ((n * 1000ll) / (size_t) wav_sample_rate);
+                            const int64_t new_total = audio_offset_ms.fetch_add(this_chunk_ms,
+                                                                                std::memory_order_relaxed)
+                                                    + this_chunk_ms;
+                            // Fire-and-forget delta; aligner worker pulls
+                            // off the socket at its own pace. Errors are
+                            // logged to last_error_ but don't fail the
+                            // audio stream.
+                            (void) aligner_session->push_partial_pcm(pcm, n, new_total);
+                        }
+                        return ok;
                     };
 
                     tts_result result;
@@ -1874,6 +2132,106 @@ int main(int argc, char ** argv) {
                         if (!tail.empty()) {
                             emit_bytes(reinterpret_cast<const char *>(tail.data()),
                                        tail.size());
+                        }
+                    }
+
+                    // ── Phase-2: finalize streaming alignment ──────────
+                    // Stop the reader thread, send the FINAL_REQ (with no
+                    // additional PCM — everything was already pushed via
+                    // on_pcm), emit speech.audio.alignment.final. Errors
+                    // surface as an alignment.error event rather than
+                    // bringing down the audio stream.
+                    if (partial_align_active && aligner_session) {
+                        partial_reader_stop.store(true, std::memory_order_relaxed);
+                        if (partial_reader_thread.joinable()) partial_reader_thread.join();
+                        const int64_t total_ms = audio_offset_ms.load(std::memory_order_relaxed);
+                        std::vector<qwen3_tts::AlignedWord> aligned;
+                        qwen3_tts::AlignProfile prof;
+                        const bool ok = aligner_session->finalize_streaming_align(
+                            /*tail_pcm=*/nullptr, /*n_tail_samples=*/0,
+                            total_ms, aligned, prof);
+                        json ev;
+                        if (ok) {
+                            json wj = json::array();
+                            for (size_t i = 0; i < aligned.size(); i++) {
+                                wj.push_back({
+                                    {"word_index", (int) i},
+                                    {"text",       aligned[i].text},
+                                    {"t0_ms",      aligned[i].t0_ms},
+                                    {"t1_ms",      aligned[i].t1_ms},
+                                });
+                            }
+                            ev = {{"type",           "speech.audio.alignment.final"},
+                                  {"audio_total_ms", total_ms},
+                                  {"words",          std::move(wj)},
+                                  {"timings", {
+                                      {"align_load_ms",      prof.t_load_ms},
+                                      {"align_resample_ms",  prof.t_resample_ms},
+                                      {"align_forward_ms",   prof.t_aligner_ms},
+                                      {"align_total_ms",     prof.t_total_ms},
+                                      {"align_n_words",      prof.n_words},
+                                      {"n_partial_events",   partial_event_count.load(std::memory_order_relaxed)},
+                                  }}};
+                            std::lock_guard<std::mutex> wlock(sink_write_mutex);
+                            std::string af = "event: speech.audio.alignment.final\ndata: "
+                                           + ev.dump() + "\n\n";
+                            sink.write(af.data(), af.size());
+                        } else {
+                            ev = {{"type",  "speech.audio.alignment.error"},
+                                  {"error", aligner_session->last_error()}};
+                            std::lock_guard<std::mutex> wlock(sink_write_mutex);
+                            std::string af = "event: speech.audio.alignment.error\ndata: "
+                                           + ev.dump() + "\n\n";
+                            sink.write(af.data(), af.size());
+                        }
+                        if (aligner_lock.owns_lock()) aligner_lock.unlock();
+                        partial_align_active = false;
+                    }
+
+                    // Forced alignment: piggyback a speech.audio.alignment
+                    // event after the last audio chunk but before done. The
+                    // aligner reads the PCM the worker cached in its
+                    // SYNTH_REQ scratch (populated either by on_pcm during
+                    // streaming or by result.audio for non-streaming). One
+                    // worker round-trip; serialised through the worker's
+                    // io_mutex_ so it can't race with another synth.
+                    // Skipped when align_stream=partial — the final event
+                    // is emitted above by the partial-streaming flow.
+                    if (is_sse && do_align && !do_align_partial &&
+                        result.success && worker_session) {
+                        auto words = whitespace_split_for_align(input);
+                        std::vector<qwen3_tts::AlignedWord> aligned;
+                        qwen3_tts::AlignProfile prof;
+                        const bool ok = !words.empty() &&
+                                        worker_session->align_words(words, aligned, prof);
+                        json ev;
+                        if (ok) {
+                            json wj = json::array();
+                            for (const auto & w : aligned) {
+                                wj.push_back({{"text", w.text},
+                                              {"t0_ms", w.t0_ms},
+                                              {"t1_ms", w.t1_ms}});
+                            }
+                            ev = {{"type",    "speech.audio.alignment"},
+                                  {"words",   std::move(wj)},
+                                  {"timings", {
+                                      {"align_load_ms",      prof.t_load_ms},
+                                      {"align_resample_ms",  prof.t_resample_ms},
+                                      {"align_forward_ms",   prof.t_aligner_ms},
+                                      {"align_total_ms",     prof.t_total_ms},
+                                      {"align_n_words",      prof.n_words},
+                                  }}};
+                            std::string af = "event: speech.audio.alignment\ndata: "
+                                           + ev.dump() + "\n\n";
+                            sink.write(af.data(), af.size());
+                        } else {
+                            ev = {{"type",  "speech.audio.alignment.error"},
+                                  {"error", words.empty()
+                                      ? std::string("input had no words to align")
+                                      : worker_session->last_error()}};
+                            std::string af = "event: speech.audio.alignment.error\ndata: "
+                                           + ev.dump() + "\n\n";
+                            sink.write(af.data(), af.size());
                         }
                     }
 
@@ -2085,14 +2443,61 @@ int main(int argc, char ** argv) {
                 {"audio", base64_encode(audio_bytes.data(), audio_bytes.size())},
             };
             std::string delta_frame = "event: speech.audio.delta\ndata: " + delta.dump() + "\n\n";
+
+            // Forced alignment for the one-shot SSE path. Synth has
+            // already returned with PCM cached in the worker (the
+            // non-streaming synth path above filled last_pcm from
+            // result.audio). One blocking IPC round-trip; the alignment
+            // event is interleaved between the (single) delta and done.
+            std::string align_frame;
+            if (do_align && result.success && worker_session) {
+                auto words = whitespace_split_for_align(input);
+                std::vector<qwen3_tts::AlignedWord> aligned;
+                qwen3_tts::AlignProfile prof;
+                const bool ok = !words.empty() &&
+                                worker_session->align_words(words, aligned, prof);
+                json ev;
+                if (ok) {
+                    json wj = json::array();
+                    for (const auto & w : aligned) {
+                        wj.push_back({{"text", w.text},
+                                      {"t0_ms", w.t0_ms},
+                                      {"t1_ms", w.t1_ms}});
+                    }
+                    ev = {{"type",    "speech.audio.alignment"},
+                          {"words",   std::move(wj)},
+                          {"timings", {
+                              {"align_load_ms",      prof.t_load_ms},
+                              {"align_resample_ms",  prof.t_resample_ms},
+                              {"align_forward_ms",   prof.t_aligner_ms},
+                              {"align_total_ms",     prof.t_total_ms},
+                              {"align_n_words",      prof.n_words},
+                          }}};
+                    align_frame = "event: speech.audio.alignment\ndata: "
+                                + ev.dump() + "\n\n";
+                } else {
+                    ev = {{"type",  "speech.audio.alignment.error"},
+                          {"error", words.empty()
+                              ? std::string("input had no words to align")
+                              : worker_session->last_error()}};
+                    align_frame = "event: speech.audio.alignment.error\ndata: "
+                                + ev.dump() + "\n\n";
+                }
+            }
+
             std::string done_frame  = "event: speech.audio.done\ndata: "
                                     + build_done_event(result)
                                     + "\n\n";
 
             res.set_chunked_content_provider("text/event-stream",
-                [delta_frame = std::move(delta_frame), done_frame = std::move(done_frame)]
+                [delta_frame = std::move(delta_frame),
+                 align_frame = std::move(align_frame),
+                 done_frame  = std::move(done_frame)]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     sink.write(delta_frame.data(), delta_frame.size());
+                    if (!align_frame.empty()) {
+                        sink.write(align_frame.data(), align_frame.size());
+                    }
                     sink.write(done_frame.data(),  done_frame.size());
                     sink.done();
                     return false;
@@ -2105,7 +2510,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "idle-unload: model will be released after %d s of inactivity\n",
                 idle_unload_seconds);
         std::thread([&tts, &synth_mutex, &last_activity_ms, &in_flight_synths,
-                     &worker_session,
+                     &worker_session, &aligner_session, &aligner_session_mutex,
                      idle_unload_seconds, now_ms]() {
             const int64_t threshold_ms = (int64_t) idle_unload_seconds * 1000;
             const int     check_s     = std::max(1, idle_unload_seconds / 5);
@@ -2136,6 +2541,19 @@ int main(int argc, char ** argv) {
                     fprintf(stderr, "idle-unload: %lld s since last activity, releasing model\n",
                             (long long) ((now_ms() - last_activity_ms.load()) / 1000));
                     tts.unload_model();
+                }
+                // Take the aligner sibling down too. Without this it kept
+                // ~730 MiB of GPU resident across the synth's idle-unload,
+                // defeating the whole point of the watchdog. try_to_lock
+                // the aligner mutex so we don't stomp a paragraph in flight
+                // (a streaming-align request holds it for the whole synth).
+                if (aligner_session) {
+                    std::unique_lock<std::mutex> alock(aligner_session_mutex, std::try_to_lock);
+                    if (alock.owns_lock() && aligner_session->is_alive()) {
+                        fprintf(stderr, "idle-unload: also killing aligner sibling pid=%d\n",
+                                (int) aligner_session->pid());
+                        aligner_session->shutdown();
+                    }
                 }
             }
         }).detach();

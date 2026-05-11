@@ -169,6 +169,33 @@ target_link_libraries(audio_tokenizer_decoder PUBLIC
     Threads::Threads
 )
 
+# Qwen3 Forced Aligner library — vendored from parakeet.cpp's qwen3-asr +
+# crisp_audio + core helpers. Drives the optional word-timing pass behind
+# /v1/audio/speech?align=true. Sits in its own static library so the
+# server target is the only consumer; CLI / tests don't see it.
+option(QWEN3_TTS_FORCED_ALIGNMENT "Build the optional forced-aligner module" ON)
+if(QWEN3_TTS_FORCED_ALIGNMENT)
+    add_library(qwen3_fa STATIC
+        src/qwen3_fa/qwen3_asr.cpp
+        src/qwen3_fa/audio_tower.cpp
+        src/qwen3_fa/core/gguf_loader.cpp
+        src/qwen3_fa/core/mel.cpp
+    )
+    target_include_directories(qwen3_fa PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen3_fa
+        ${GGML_DIR}/include
+    )
+    # core/gguf_loader.cpp pulls ggml-backend-impl.h for the custom
+    # mmap-owning CPU buffer registration. Header lives in ggml/src/.
+    target_include_directories(qwen3_fa PRIVATE
+        ${GGML_DIR}/src
+    )
+    target_link_libraries(qwen3_fa PUBLIC
+        ggml
+        Threads::Threads
+    )
+endif()
+
 # Qwen3 TTS library (full pipeline)
 add_library(qwen3_tts STATIC
     src/qwen3_tts.cpp
@@ -290,6 +317,10 @@ if(QWEN3_TTS_SERVER)
         nlohmann_json::nlohmann_json
         PkgConfig::LIBAV
     )
+    if(QWEN3_TTS_FORCED_ALIGNMENT)
+        target_link_libraries(qwen3-tts-server PRIVATE qwen3_fa)
+        target_compile_definitions(qwen3-tts-server PRIVATE QWEN3_TTS_HAS_FORCED_ALIGNMENT=1)
+    endif()
 
     # Smoke-test for the worker-isolation IPC scaffolding (P1). Fires
     # spawn_worker → echo PINGs → SHUTDOWN. Doesn't link Qwen3TTS so it

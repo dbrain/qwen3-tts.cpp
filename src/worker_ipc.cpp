@@ -192,7 +192,8 @@ bool unpack_audio_payload(const std::vector<uint8_t> & payload,
 
 pid_t spawn_worker(const char * self_argv0,
                    const std::vector<std::string> & extra_argv,
-                   int * out_parent_fd) {
+                   int * out_parent_fd,
+                   const char * role_flag) {
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
         fprintf(stderr, "spawn_worker: socketpair failed: %s\n", strerror(errno));
@@ -224,7 +225,7 @@ pid_t spawn_worker(const char * self_argv0,
 
         std::vector<std::string> owned;
         owned.emplace_back(self_argv0);
-        owned.emplace_back("--worker");
+        owned.emplace_back(role_flag ? role_flag : "--worker");
         owned.emplace_back(fd_buf);
         for (auto & a : extra_argv) owned.push_back(a);
 

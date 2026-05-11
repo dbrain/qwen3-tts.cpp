@@ -46,6 +46,26 @@ enum class WorkerFrame : uint32_t {
     ENCODE_CODES_RESP  = 0x53, // W→P  {"ok": bool, "error": str, "n_frames": int} + raw i32 codes
     SAVE_WARMUP_REQ    = 0x54, // P→W  {"voice_id", "prefill_key", "ref_hash", "path", "model_id"}
     SAVE_WARMUP_RESP   = 0x55, // W→P  {"ok": bool, "error": str}
+    ALIGN_REQ          = 0x60, // P→W  {"words": [str,...]} — aligns against last synth's PCM
+    ALIGN_RESP         = 0x61, // W→P  {"ok": bool, "error": str, "words":[{"text","t0_ms","t1_ms"}], "duration_ms", "profile"{...}}
+    // Streaming-alignment frames (P2). Parent sends PCM deltas as audio is
+    // generated; aligner worker re-runs the full FA encode + aligner LLM
+    // pass on accumulated audio and emits updated word timings. PARTIAL is
+    // an interim result emitted while audio is still arriving; FINAL is the
+    // last call after TTS completes — locks in timings.
+    //
+    // ALIGN_PARTIAL_REQ payload: pack_audio_payload() with json:
+    //   {"words":[str,...], "pcm_sample_rate":int, "audio_seen_ms":int,
+    //    "reset":bool}   followed by raw f32 PCM samples (the *delta*; the
+    //   aligner appends to its internal accumulator).
+    // ALIGN_PARTIAL_RESP / ALIGN_FINAL_RESP payload (pure JSON):
+    //   {"ok":bool, "error":str, "audio_seen_ms":int,
+    //    "words":[{"word_index","char_offset","text","t0_ms","t1_ms"}],
+    //    "profile":{...}}
+    ALIGN_PARTIAL_REQ  = 0x62,
+    ALIGN_PARTIAL_RESP = 0x63,
+    ALIGN_FINAL_REQ    = 0x64,
+    ALIGN_FINAL_RESP   = 0x65,
     PING         = 0x40,  // either {"t_send_ns": u64}
     PONG         = 0x41,  // either {"t_send_ns": u64, "t_recv_ns": u64}
     SHUTDOWN     = 0xFF,  // P→W   ask worker to exit cleanly
@@ -133,7 +153,8 @@ bool unpack_audio_payload(const std::vector<uint8_t> & payload,
 // have seen if started normally.
 pid_t spawn_worker(const char * self_argv0,
                    const std::vector<std::string> & extra_argv,
-                   int * out_parent_fd);
+                   int * out_parent_fd,
+                   const char * role_flag = "--worker");
 
 } // namespace qwen3_tts
 

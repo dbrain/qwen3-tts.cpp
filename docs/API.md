@@ -21,6 +21,7 @@ Main TTS endpoint. Accepts JSON body, returns audio (one-shot) or a streaming re
 | `max_audio_tokens` | this fork | 1..8192, default 2048; KV `n_ctx` scales linearly (linear t/s tax) |
 | `stream_batch_size` | this fork | vocoder chunk size, default 30; smaller = lower per-chunk sched_cu, similar TTFA |
 | `stream_first_batch_size` | this fork | first chunk only, default 1 = lowest TTFA |
+| `align` | this fork | `true` emits a `speech.audio.alignment` SSE event with per-word `t0_ms`/`t1_ms` after the audio stream completes. Requires `stream_format="sse"` + worker isolation + `--hf-repo-fa` configured at server start. Adds ~few-hundred ms tail latency (mostly a single forward pass through the 0.6B aligner; ~700 ms one-time cold load on the very first request). |
 
 ### Streaming-mode matrix (`response_format` × `stream_format`)
 
@@ -63,6 +64,27 @@ With `stream_first_batch_size=1` the first emit is a single 12 Hz codec frame, s
 Hot-path TTFA stays flat across audio length — neither doubles for a 17 s synth nor halves for a 0.6 s one — because only the first codec frame has to be ready before bytes flow.
 
 The cache-MISS path pays the warmup decode once per voice on the first synth in a fresh process, then persists the snapshot to `voice.warmup` on disk so subsequent boots restore from disk in single-digit-ms.
+
+### Forced alignment (`align: true`)
+
+When `stream_format="sse"` and `align=true`, after the last `speech.audio.delta` and before `speech.audio.done` the server emits one extra event:
+
+```
+event: speech.audio.alignment
+data: {"type":"speech.audio.alignment",
+       "words":[{"text":"Hello","t0_ms":120,"t1_ms":480}, ...],
+       "timings":{"align_load_ms":0,"align_resample_ms":4,
+                  "align_forward_ms":340,"align_total_ms":345,
+                  "align_n_words":42}}
+```
+
+The aligner is `qwen3-forced-aligner-0.6b` (Qwen3-ASR architecture, 5000-class lm_head outputting 80 ms timestamp resolution). The server splits `input` on whitespace; the order in `words[]` matches that split. `align_load_ms` is non-zero only on the very first request (lazy load on first use). On error the server emits `speech.audio.alignment.error` instead of `speech.audio.alignment` and continues to `done`.
+
+Requires:
+
+- Server started with `--hf-repo-fa cstr/qwen3-forced-aligner-0.6b-GGUF:Q4_K` (or `QWEN3_TTS_FA_REPO` env in Docker)
+- Worker isolation (`QWEN3_TTS_WORKER_ISOLATION=1`; the aligner runs in the worker subprocess against the cached synth PCM)
+- `stream_format="sse"` — non-SSE callers get a 400
 
 ## `GET /v1/audio/voices`
 
