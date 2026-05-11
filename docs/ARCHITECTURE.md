@@ -229,6 +229,69 @@ Warm-state RTF is 4.25–4.41×, matching the in-process baseline of 4.17× with
 
 ---
 
+## Forced alignment sibling subprocess
+
+When `--hf-repo-fa` is set at server start, the parent constructs a second `WorkerSession` (`aligner_only=true`, spawned via `--worker-aligner <fd>`). It loads ONLY the FA GGUF — no talker, no vocoder, no spk-encoder — and services `ALIGN_PARTIAL_REQ` / `ALIGN_FINAL_REQ` against a host-side PCM accumulator that grows as the parent forwards `audio.delta` deltas during a streaming-aligned request.
+
+```
+parent                synth worker             aligner sibling
+──────                ────────────             ───────────────
+HTTP server
+streaming aligned     reads SYNTH_REQ ─►       reads ALIGN_PARTIAL_REQ ─►
+TTS handler           runs talker+vocoder       runs FA encoder + body
+  ├─ socketpair() ─◄  emits AUDIO_FRAME ◄───────┤ emits ALIGN_PARTIAL_RESP
+  ├─ on_pcm:                                    │ (re-emits all words +
+  │   forward to client                         │  audio_seen_ms)
+  │   push_partial_pcm() to aligner ────────────►
+  └─ /unload + idle: SIGKILL both children
+```
+
+Two CUDA contexts, two GPU streams, two `WorkerSession::io_mutex`es. Synth and align run in true parallel — no shared-stream contention, no shared graph cache. The trade is a second per-process CUDA primary context overhead (~143 MiB cuBLAS + driver) in exchange for SIGKILL-clean isolation. Lazy-loaded: the aligner sibling spawns on the first request that needs it (~160 ms parent→child + ~500-700 ms FA GGUF load + ~500-700 ms first encode + body = **~1.2 s cold path total**), and unloads alongside the synth worker on `/v1/admin/unload` / idle-unload.
+
+### Why the LLM body runs on CPU by default
+
+The aligner sibling bakes `CRISPASR_N_GPU_LAYERS=0` as a default: all 28 Qwen3-0.6B blk layers route to host RAM (~237 MiB), only the audio tower + non-layered LLM tensors + KV stay on GPU. The cost is **+5 % end-to-end wallclock** vs running the body on GPU; the saving is **~210 MiB GPU**. For a 12 GB consumer GPU sharing the device with a 7 GB LLM + 2.4 GB vision encoder + 3 GB synth worker, that's the right trade. Override with `CRISPASR_N_GPU_LAYERS=28` if you have VRAM and want the time back.
+
+The aligner sibling also bakes `GGML_CUDA_DISABLE_GRAPHS=1` (cuda-graph capture holds ~48 MiB of context state but never replays under the per-pass topology churn of streaming-partial alignment) and `CRISPASR_QWEN3_ASR_FUSED_QKV=0` (kills the 63 MiB fused-QKV buffer that duplicates attn_q/k/v already in mod). All three are env-overridable per launch.
+
+### Steady-state VRAM breakdown (RTX 3060, Q4_K aligner, 30 s paragraph)
+
+```
+mod    =  86.3   non-layered LLM (embed, lm_head, ln_f) on GPU
+a_mod  = 176.6   audio tower weights on GPU
+kv     =  67.8   KV cache (grows linearly with audio length)
+sched  =  46.7   LLM body sched compute buf (multi-backend)
+a_conv =  18.5   audio conv frontend gallocr
+a_sched=  15.7   audio body sched compute buf
+other  = 143.3   CUDA primary context + cuBLAS workspace
+─────
+556 MiB GPU + 237 MiB host RAM (28 LLM blk layers)
+```
+
+The audio-tower weight load is filtered out of qwen3_asr's main `load_weights` via a drop predicate (`core_gguf::load_weights_with_drop`), since `crisp_audio` loads `audio.*` separately into its own backend buffer — without the filter qwen3_asr would duplicate ~176 MiB of audio tensors on top.
+
+### IPC frames added for alignment
+
+| frame | dir | payload |
+|---|---|---|
+| `ALIGN_PARTIAL_REQ` | P→aligner | `{pcm_sample_rate, audio_seen_ms, reset?, words[]}` + raw f32 PCM delta |
+| `ALIGN_PARTIAL_RESP` | aligner→P | `{ok, error, audio_seen_ms, words[{word_index, text, t0_ms, t1_ms}], profile{}}` |
+| `ALIGN_FINAL_REQ` | P→aligner | same shape as PARTIAL_REQ; aligner emits the cached last-partial result without re-running encode + body when no new PCM arrived (audio_seen_ms unchanged) |
+| `ALIGN_FINAL_RESP` | aligner→P | same shape as PARTIAL_RESP |
+
+The aligner subprocess runs alignment in parallel with synth. For a 30 s paragraph the parent typically pushes ~7 PCM deltas through `push_partial_pcm()` and gets ~7 partial responses interleaved with `audio.delta` events on the client SSE stream, then a final response (~0 ms when cached) just before `done`. Wire-format details + event payload examples in [docs/API.md#forced-alignment](API.md#forced-alignment).
+
+### Per-paragraph state
+
+Aligner-worker scope holds:
+- PCM accumulator (`std::vector<float>`, sample rate locked on first call, cleared on `reset=true`)
+- `qwen3_asr_context*` (loaded lazily on first ALIGN_*_REQ, persists across paragraphs)
+- Cached last-partial response (words + t0_ms + t1_ms + audio_seen_ms + pcm_n) — invalidated on `reset=true`, used to short-circuit a redundant final pass
+
+No KV-cache reuse across partials *within* a paragraph yet — each partial re-runs the full body forward on the grown prompt. That's the next perf lever; see `HANDOFF-fa-aligner-vram-2.md` in the dev iter directory.
+
+---
+
 ## Dead ends
 
 Things that were tried, measured, and ripped out — kept here so future agents don't re-derive.
