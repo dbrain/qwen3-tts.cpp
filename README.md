@@ -66,12 +66,31 @@ Anecdotal starting points on the same RTX 3060 (per measurements at fork time, n
 
 In-process HTTP server (`qwen3-tts-server`), OpenAI-compatible with this fork's extras layered on:
 
-- `POST /v1/audio/speech` — main TTS endpoint. Body accepts `input` / `voice` / `instructions` (voice design) / `seed` / `temperature` / `top_k` / `repetition_penalty` / `language` / `max_audio_tokens` / `stream_batch_size`. Streaming via `stream_format=sse` + `response_format=pcm` for low TTFA.
+- `POST /v1/audio/speech` — main TTS endpoint. Body accepts `input` / `voice` / `instructions` (voice design) / `seed` / `temperature` / `top_k` / `repetition_penalty` / `language` / `max_audio_tokens` / `stream_batch_size` / `align` / `align_stream`. Streaming via `stream_format=sse` + `response_format=pcm` for low TTFA.
 - `POST /v1/audio/voices` — register a voice clone (multipart: `name` + `audio_sample` WAV + optional `ref_text` ICL transcript). Lazy loads encoders, persists `voice.bundle` + (after first synth) `voice.warmup` to the archive volume.
 - `GET /v1/audio/voices` — list voices.
+- `GET /v1/audio/voices/{name}/sample.wav` / `GET /v1/audio/voices/{name}/ref_text` — fetch the original reference WAV / ICL transcript the clone was registered with (debug / re-upload only; synthesis runs from the bundle).
 - `DELETE /v1/audio/voices/{name}` — remove from in-memory map. `voice.bundle` on disk persists by design (re-register or restart-rescan picks it back up).
-- `POST /v1/admin/load` / `POST /v1/admin/unload` — explicit GPU lifecycle control.
+- `POST /v1/admin/load` / `POST /v1/admin/unload` — explicit GPU lifecycle control. With worker isolation, unload also SIGKILLs the aligner sibling subprocess if it was loaded.
 - `GET /health`, `GET /v1/models`, `GET /v1/audio/languages`.
+
+### Forced alignment (optional)
+
+Opt-in word-level timestamping via a sibling subprocess running `qwen3-forced-aligner-0.6b` (Qwen3-ASR architecture, 5000-class lm_head, 80 ms resolution). Set `--hf-repo-fa cstr/qwen3-forced-aligner-0.6b-GGUF:Q4_K` at server start (or `QWEN3_TTS_FA_REPO` / `QWEN3_TTS_FA_QUANT` in Docker), then per-request:
+
+- `align: true` + `stream_format: "sse"` — required for any alignment delivery.
+- `align_stream: "final-only"` (default) — one `speech.audio.alignment.final` event after the audio stream completes. ~700 ms tail latency before `done`.
+- `align_stream: "partial"` — `speech.audio.alignment.partial` events interleaved with `audio.delta` as audio is produced, plus a final event. ~150 ms end-to-end overhead vs `align=off` (aligner runs concurrent with synth in a sibling subprocess).
+
+Cost on RTX 3060 / Q4_K aligner / 30 s paragraph:
+
+| | one-shot first request | partial mid-paragraph | partial final |
+|---|---:|---:|---:|
+| wall | ~1.2 s | ~200-500 ms | ~0 ms (cached when audio_seen unchanged) |
+
+VRAM: **~556 MiB** in the aligner sibling subprocess (Q4_K), plus ~237 MiB of host RAM for the 28 LLM blk layers (routed to CPU by default — `CRISPASR_N_GPU_LAYERS=0` baked; set to `28` to keep them on GPU at +210 MiB / −5 % wallclock). On a 12 GB Ampere, synth + aligner together fit in ~3.7 GiB. Word timings are deterministic and bit-identical between the partial and one-shot paths (single argmax, no sampling).
+
+→ Full event format, breakdown, and overrides in [docs/API.md](docs/API.md#forced-alignment).
 
 Lifecycle env vars worth knowing about:
 

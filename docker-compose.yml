@@ -89,10 +89,17 @@ services:
       # ── Forced alignment (opt-in for audiobook read-along etc.) ──────
       # Leave QWEN3_TTS_FA_REPO empty (default) to disable: align=true
       # requests return 400 with a helpful error. Set the repo to enable;
-      # the GGUF (~530 MB Q4_K) is fetched on first server boot and the
-      # aligner itself lazy-loads in the worker on first ?align=true
-      # request (~700-1000 ms cold path). Keeps ~530 MB resident in the
-      # worker until idle-unload SIGKILLs it.
+      # the GGUF (~530 MB on disk, Q4_K) is fetched on first server boot
+      # and a sibling subprocess lazy-loads it on the first align=true
+      # request (~1.2 s cold path). Steady-state GPU footprint ~556 MiB
+      # plus ~237 MiB host RAM for the LLM body (which is routed to CPU
+      # by default — set CRISPASR_N_GPU_LAYERS=28 to keep on GPU).
+      # /v1/admin/unload + idle-unload SIGKILL the aligner alongside the
+      # synth worker.
+      #
+      # Per-request delivery via the `align_stream` body param:
+      #   "final-only" (default) — one final event, ~700 ms tail latency
+      #   "partial"             — interleaved partials, ~150 ms end-to-end
       # QWEN3_TTS_FA_REPO:       cstr/qwen3-forced-aligner-0.6b-GGUF
       # QWEN3_TTS_FA_QUANT:      Q4_K
 

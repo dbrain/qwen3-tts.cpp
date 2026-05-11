@@ -152,11 +152,17 @@ ENV QWEN3_TTS_TALKER_REPO=khimaros/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF \
     QWEN3_TTS_SE_QUANT=F16
 
 # Forced aligner (opt-in). Empty FA_REPO disables `align=true` requests
-# with a 400. When set, the worker lazy-loads ~530 MB (Q4_K) on first
-# align request and keeps the model resident until idle-unload kills the
-# worker. The aligner is a Qwen3 0.6B variant with a 5000-class lm_head
-# predicting 80 ms-resolution timestamp classes — same architecture as
-# qwen3-asr, different head.
+# with a 400. When set, a sibling subprocess lazy-loads the Q4_K GGUF
+# (~530 MB on disk) on first align request and keeps it resident until
+# idle-unload SIGKILLs both synth + aligner workers. The aligner is a
+# Qwen3 0.6B variant with a 5000-class lm_head predicting 80 ms timestamp
+# classes — same architecture as qwen3-asr, different head.
+#
+# Steady-state aligner GPU resident: ~556 MiB on RTX 3060 (Q4_K). The
+# 28 LLM blk layers route to host RAM (~237 MiB) by default; set
+# CRISPASR_N_GPU_LAYERS=28 to keep them on GPU (+210 MiB / −5 % wall).
+# align_stream:"partial" runs concurrent with synth, adding ~150 ms
+# end-to-end; align_stream:"final-only" adds ~700 ms tail latency.
 ENV QWEN3_TTS_FA_REPO= \
     QWEN3_TTS_FA_QUANT=Q4_K
 

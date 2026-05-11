@@ -21,7 +21,8 @@ Main TTS endpoint. Accepts JSON body, returns audio (one-shot) or a streaming re
 | `max_audio_tokens` | this fork | 1..8192, default 2048; KV `n_ctx` scales linearly (linear t/s tax) |
 | `stream_batch_size` | this fork | vocoder chunk size, default 30; smaller = lower per-chunk sched_cu, similar TTFA |
 | `stream_first_batch_size` | this fork | first chunk only, default 1 = lowest TTFA |
-| `align` | this fork | `true` emits a `speech.audio.alignment` SSE event with per-word `t0_ms`/`t1_ms` after the audio stream completes. Requires `stream_format="sse"` + worker isolation + `--hf-repo-fa` configured at server start. Adds ~few-hundred ms tail latency (mostly a single forward pass through the 0.6B aligner; ~700 ms one-time cold load on the very first request). |
+| `align` | this fork | `true` enables forced alignment. Requires `stream_format="sse"` + worker isolation + `--hf-repo-fa` at server start. Delivery mode set by `align_stream`. |
+| `align_stream` | this fork | `"final-only"` (default) emits one `speech.audio.alignment.final` event after the audio stream completes. `"partial"` additionally emits `speech.audio.alignment.partial` events *interleaved* with `speech.audio.delta` as audio is produced — each partial re-emits the full word list with timings refreshed against the audio seen so far; the final event has locked timings. Partial mode runs the aligner in a sibling subprocess concurrent with synth — adds ~150 ms end-to-end vs `align=off` (vs ~700 ms for the legacy `align=true`+`final-only` path). Ignored when `align=false`. |
 
 ### Streaming-mode matrix (`response_format` × `stream_format`)
 
@@ -65,26 +66,93 @@ Hot-path TTFA stays flat across audio length — neither doubles for a 17 s synt
 
 The cache-MISS path pays the warmup decode once per voice on the first synth in a fresh process, then persists the snapshot to `voice.warmup` on disk so subsequent boots restore from disk in single-digit-ms.
 
-### Forced alignment (`align: true`)
+### Forced alignment
 
-When `stream_format="sse"` and `align=true`, after the last `speech.audio.delta` and before `speech.audio.done` the server emits one extra event:
+`qwen3-forced-aligner-0.6b` — Qwen3-ASR architecture with a 5000-class lm_head outputting 80 ms timestamp resolution. The server splits `input` on whitespace; the order in `words[]` matches that split. Word timings are deterministic — argmax over the timestamp logits, no sampling — so repeated runs with the same audio + word list produce bit-identical timings.
+
+#### Setup (one-time, per server)
+
+- Start with `--hf-repo-fa cstr/qwen3-forced-aligner-0.6b-GGUF:Q4_K` (or set `QWEN3_TTS_FA_REPO=cstr/qwen3-forced-aligner-0.6b-GGUF` + `QWEN3_TTS_FA_QUANT=Q4_K` in Docker).
+- Worker isolation (`QWEN3_TTS_WORKER_ISOLATION=1`) is mandatory — the aligner runs in a dedicated subprocess.
+- `stream_format="sse"` is mandatory — non-SSE callers get a `400`. Alignment is delivered as SSE events, not a separate response field.
+
+#### Two delivery modes
+
+| `align_stream` | When you get timings | Sibling subprocess | Audio-pipeline impact |
+|---|---|---|---|
+| `"final-only"` (default) | One `speech.audio.alignment.final` event after `speech.audio.delta` stream ends, before `done` | Reuses the synth worker | Adds ~700 ms tail latency before `done` |
+| `"partial"` | `speech.audio.alignment.partial` events interleaved with audio.delta as audio is produced, plus a final event at the end | Spawns a separate aligner-only worker (Q4_K aligner) on first request | Adds ~150 ms end-to-end (aligner runs concurrent with synth; the final event short-circuits when audio_seen hasn't grown since the last partial) |
+
+#### Cold load
+
+First request that needs alignment pays:
+
+- Aligner sibling subprocess spawn: ~160 ms
+- Q4_K aligner GGUF load + GPU buffer alloc: ~500-700 ms
+- First-pass audio encode + body forward: ~500-700 ms
+
+Total first-request alignment overhead: **~1.2 s**. Subsequent partial requests reuse the loaded aligner; per-partial steady-state cost is ~150-500 ms (linear in accumulated PCM length), running concurrent with synth so most of it hides behind audio.delta emissions.
+
+The aligner subprocess unloads alongside the synth worker on `/v1/admin/unload` and the idle-unload watchdog — no separate lifecycle.
+
+#### Aligner VRAM cost
+
+Steady-state GPU resident in the aligner sibling subprocess: **~556 MiB** (RTX 3060, Q4_K aligner, 30 s paragraph). Breakdown:
+
+| region | MiB | notes |
+|---|---:|---|
+| non-layered LLM weights (embed, lm_head, norms) | 86 | Q4_K |
+| audio tower weights | 177 | Q4_K |
+| KV cache | 30-70 | grows linearly with audio length |
+| audio encoder gallocr + body sched | 35 | fixed-shape |
+| LLM body sched (multi-backend) | 47 | growing with prompt length |
+| CUDA primary context + cuBLAS workspace | 143 | irreducible per-process |
+
+Plus **~237 MiB of host RAM** for the 28 LLM blk layers — the aligner-only subprocess routes them to CPU by default (`CRISPASR_N_GPU_LAYERS=0` baked) to keep GPU footprint small. CPU body forward costs ~+5 % wallclock end-to-end vs running the LLM body on GPU; the trade saves ~210 MiB of GPU. Set `CRISPASR_N_GPU_LAYERS=28` to revert to GPU body if you have the VRAM and want the time back.
+
+#### One-shot `final-only` mode
 
 ```
-event: speech.audio.alignment
-data: {"type":"speech.audio.alignment",
-       "words":[{"text":"Hello","t0_ms":120,"t1_ms":480}, ...],
-       "timings":{"align_load_ms":0,"align_resample_ms":4,
-                  "align_forward_ms":340,"align_total_ms":345,
-                  "align_n_words":42}}
+event: speech.audio.alignment.final
+data: {"type":"speech.audio.alignment.final",
+       "audio_total_ms": 17280,
+       "words": [{"word_index":0,"text":"In","t0_ms":120,"t1_ms":280}, ...],
+       "timings": {"align_load_ms": 0,
+                   "align_resample_ms": 4,
+                   "align_forward_ms": 340,
+                   "align_total_ms": 345,
+                   "align_n_words": 73,
+                   "n_partial_events": 0}}
 ```
 
-The aligner is `qwen3-forced-aligner-0.6b` (Qwen3-ASR architecture, 5000-class lm_head outputting 80 ms timestamp resolution). The server splits `input` on whitespace; the order in `words[]` matches that split. `align_load_ms` is non-zero only on the very first request (lazy load on first use). On error the server emits `speech.audio.alignment.error` instead of `speech.audio.alignment` and continues to `done`.
+`align_load_ms` is non-zero only on the very first request (lazy load on first use). On error the server emits `speech.audio.alignment.error` carrying `{"error": "..."}` instead, then continues to `done`.
 
-Requires:
+#### Streaming `partial` mode
 
-- Server started with `--hf-repo-fa cstr/qwen3-forced-aligner-0.6b-GGUF:Q4_K` (or `QWEN3_TTS_FA_REPO` env in Docker)
-- Worker isolation (`QWEN3_TTS_WORKER_ISOLATION=1`; the aligner runs in the worker subprocess against the cached synth PCM)
-- `stream_format="sse"` — non-SSE callers get a 400
+`align_stream:"partial"` opts into interleaved partial events. Each partial re-emits ALL words; clients should key by `word_index` and overwrite timings on each event. The `final` event carries locked timings.
+
+```
+event: speech.audio.delta
+data: {"type":"speech.audio.delta","audio":"<base64-pcm>"}
+
+event: speech.audio.alignment.partial
+data: {"type":"speech.audio.alignment.partial",
+       "audio_seen_ms": 2480,
+       "words": [{"word_index":0,"text":"In","t0_ms":120,"t1_ms":280}, ...]}
+
+event: speech.audio.delta
+data: {"type":"speech.audio.delta","audio":"<base64-pcm>"}
+
+... more delta + partial events interleaved ...
+
+event: speech.audio.alignment.final
+data: {"type":"speech.audio.alignment.final","audio_total_ms":17280,"words":[...],"timings":{...}}
+
+event: speech.audio.done
+data: {...}
+```
+
+A 17 s paragraph at default streaming defaults typically produces ~9 audio.delta events and ~7 partial events plus the final. First partial arrives within ~600 ms of the first audio.delta (warmed) / ~1.2 s (cold). The final event carries identical timings to the last partial in steady state (the server short-circuits a redundant final pass when no new audio arrived since the last partial — same audio + same word list = same alignment by construction).
 
 ## `GET /v1/audio/voices`
 
@@ -124,7 +192,7 @@ Remove the voice from the in-memory map. **Disk artifacts persist** — `voice.b
 | `GET` | `/v1/models` | OpenAI-compat models list |
 | `GET` | `/v1/audio/languages` | language codes the model supports |
 | `POST` | `/v1/admin/load` | re-materialize the model from captured paths (no-op if already loaded). In worker-isolation mode this respawns the worker subprocess. |
-| `POST` | `/v1/admin/unload` | release all GPU/CPU buffers. **Single-process mode**: frees model weights + KV slabs but the ~370 MiB CUDA-context floor stays resident until process exit. **Worker-isolation mode** (`QWEN3_TTS_WORKER_ISOLATION=1`): SIGKILL + waitpid the worker subprocess; the response only returns once the kernel has reaped it, so VRAM is fully reclaimed by the time the HTTP response sends (~80–100 ms wall). |
+| `POST` | `/v1/admin/unload` | release all GPU/CPU buffers. **Single-process mode**: frees model weights + KV slabs but the ~370 MiB CUDA-context floor stays resident until process exit. **Worker-isolation mode** (`QWEN3_TTS_WORKER_ISOLATION=1`): SIGKILL + waitpid the worker subprocess; the response only returns once the kernel has reaped it, so VRAM is fully reclaimed by the time the HTTP response sends (~80–100 ms wall). The aligner sibling subprocess (if loaded) is killed in the same call — response carries `aligner_unloaded: true` when the aligner had been resident. Idle-unload (`QWEN3_TTS_IDLE_UNLOAD_SECONDS`) does the same teardown. |
 
 `POST /v1/admin/{load,unload}` give you explicit control over GPU lifecycle, useful for sharing the GPU with intermittent peers. Otherwise idle-unload via `QWEN3_TTS_IDLE_UNLOAD_SECONDS` does it automatically.
 
@@ -166,6 +234,16 @@ Voice survives across model swaps as long as `model_id` matches. Mismatched bund
 | `QWEN3_TTS_DEFAULT_STREAM_FIRST_BATCH_SIZE` | `1` | first chunk is one codec frame (lowest TTFA) |
 | `QWEN3_TTS_VOCODER_FP16_CASCADE` | `1` | F16 cascade activations; `=0` reverts to F32 (heavier sched_cu) |
 | `QWEN3_TTS_VOCODER_NO_Q8_LOAD` | unset | `=1` keeps vocoder mat-mul weights F16 instead of Q8_0 |
+
+### Forced alignment
+
+| Var | Default | Notes |
+|---|---|---|
+| `QWEN3_TTS_FA_REPO` | unset (alignment disabled) | HF repo of the forced-aligner GGUF. Set to `cstr/qwen3-forced-aligner-0.6b-GGUF` to enable. Empty = `align=true` requests return 400. Resolves to a `--hf-repo-fa` CLI flag in the Docker entrypoint. |
+| `QWEN3_TTS_FA_QUANT` | `Q4_K` | quant suffix for the FA repo. Q4_K is the user-supported floor; smaller quants are not validated. |
+| `CRISPASR_N_GPU_LAYERS` | `0` (aligner subprocess only — all 28 LLM blk layers on CPU) | aligner-only baked default. Set to `28` to keep the LLM body on GPU (+210 MiB GPU, −5 % wallclock). The synth worker is unaffected by this env. |
+| `CRISPASR_QWEN3_ASR_FUSED_QKV` | `0` (aligner-only baked default) | drops the 63 MiB fused-QKV duplicate buffer. Set to `1` to re-enable fusion (slightly faster body forward on the aligner; not worth the VRAM under C1). |
+| `GGML_CUDA_DISABLE_GRAPHS` | `1` (aligner-only baked default) | aligner subprocess can't capture useful cuda graphs under the streaming-partial topology-churn workload — disabling reclaims ~48 MiB of context state with no perf loss. Set to `0` to re-enable (no-op on the cache count). |
 
 ### Performance opt-outs (debug only — defaults are correct)
 
