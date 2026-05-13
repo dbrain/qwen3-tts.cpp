@@ -178,6 +178,117 @@ static std::string voice_bundle_path(const std::string & archive_dir, const std:
     return archive_dir + "/" + name + "/voice.bundle";
 }
 
+// Streaming loudness AGC for long-prompt drift mitigation.
+// Qwen3-TTS (both this port and upstream PyTorch) drifts down in
+// volume on long generations (~−0.02 to −0.08 dB/s over 100 s+). pt
+// with max_new_tokens raised from 1024 to 2200 drifts identically,
+// confirming the behavior is in the model, not the port. This AGC
+// tracks RMS during a 5 s learning phase then applies slew-limited
+// gain to keep the running envelope near the learned target.
+//
+// Tunings deliberately conservative — no pumping artefacts on speech
+// dynamics, no over-amplification of silence. Defaults: 1.5 dB/s slew,
+// ±18 dB max correction, 50 ms attack / 500 ms release envelope.
+class LoudnessAGC {
+public:
+    LoudnessAGC(int sample_rate, double target_rms_lock_sec = 5.0,
+                double max_gain_db_per_sec = 1.5, double max_abs_gain_db = 18.0)
+        : sample_rate_(sample_rate),
+          target_lock_samples_((size_t)(target_rms_lock_sec * sample_rate)),
+          max_gain_db_per_sec_(max_gain_db_per_sec),
+          max_abs_gain_db_(max_abs_gain_db) {}
+
+    // Process pcm in-place: chunk RMS → envelope → desired gain →
+    // slew-limit → apply with soft-clip.
+    void process(float * pcm, size_t n) {
+        if (n == 0) return;
+
+        double sumsq = 0.0;
+        for (size_t i = 0; i < n; ++i) sumsq += (double) pcm[i] * pcm[i];
+        const double chunk_rms = std::sqrt(sumsq / (double) n);
+
+        // Envelope: fast attack, slow release. Coefficients targeting
+        // ~50 ms attack / ~500 ms release at sample_rate.
+        const double dt = (double) n / (double) sample_rate_;
+        const double attack_tau = 0.05;
+        const double release_tau = 0.5;
+        const double a_attack = 1.0 - std::exp(-dt / attack_tau);
+        const double a_release = 1.0 - std::exp(-dt / release_tau);
+        const double a = (chunk_rms > envelope_rms_) ? a_attack : a_release;
+        envelope_rms_ = (1.0 - a) * envelope_rms_ + a * chunk_rms;
+
+        samples_seen_ += n;
+
+        // Silence floor: skip AGC for near-silent chunks.
+        const double silence_floor = 0.005;
+        if (envelope_rms_ < silence_floor) {
+            const float g = (float) current_gain_;
+            for (size_t i = 0; i < n; ++i) pcm[i] *= g;
+            return;
+        }
+
+        // Learning phase: collect target RMS over first N seconds.
+        if (samples_seen_ <= target_lock_samples_) {
+            target_acc_sumsq_ += sumsq;
+            target_acc_samples_ += n;
+            // No correction during learning.
+            return;
+        }
+        if (!target_locked_) {
+            target_rms_ = std::sqrt(target_acc_sumsq_ / std::max<size_t>(1, target_acc_samples_));
+            target_locked_ = true;
+            if (std::getenv("QWEN3_TTS_LOUDNESS_AGC_DEBUG")) {
+                fprintf(stderr, "[agc] learned target_rms=%.5f (%.2f dBFS) after %.1fs\n",
+                        target_rms_, 20.0 * std::log10(target_rms_ + 1e-9),
+                        (double) samples_seen_ / sample_rate_);
+            }
+        }
+
+        // Desired gain to bring envelope to target.
+        double desired_gain = target_rms_ / envelope_rms_;
+        double desired_gain_db = 20.0 * std::log10(desired_gain + 1e-9);
+        if (desired_gain_db > max_abs_gain_db_) desired_gain_db = max_abs_gain_db_;
+        if (desired_gain_db < -max_abs_gain_db_) desired_gain_db = -max_abs_gain_db_;
+
+        // Slew-limit the gain change (dB/sec).
+        const double current_db = 20.0 * std::log10(current_gain_ + 1e-9);
+        const double max_step_db = max_gain_db_per_sec_ * dt;
+        double step_db = desired_gain_db - current_db;
+        if (step_db > max_step_db) step_db = max_step_db;
+        if (step_db < -max_step_db) step_db = -max_step_db;
+        current_gain_ *= std::pow(10.0, step_db / 20.0);
+
+        // Apply with soft-clip.
+        const float g = (float) current_gain_;
+        for (size_t i = 0; i < n; ++i) {
+            float v = pcm[i] * g;
+            if (v > 0.95f)  v = 0.95f + 0.05f * std::tanh((v - 0.95f) / 0.05f);
+            if (v < -0.95f) v = -0.95f + 0.05f * std::tanh((v + 0.95f) / 0.05f);
+            pcm[i] = v;
+        }
+    }
+
+    // Current state for logging.
+    double current_gain_db() const { return 20.0 * std::log10(current_gain_ + 1e-9); }
+    double envelope_db()     const { return 20.0 * std::log10(envelope_rms_ + 1e-9); }
+    double target_db()       const { return 20.0 * std::log10(target_rms_   + 1e-9); }
+    bool   target_locked()   const { return target_locked_; }
+
+private:
+    int    sample_rate_;
+    size_t target_lock_samples_;
+    double max_gain_db_per_sec_;
+    double max_abs_gain_db_;
+
+    double current_gain_   = 1.0;
+    double envelope_rms_   = 0.0;
+    double target_rms_     = 0.0;
+    bool   target_locked_  = false;
+    size_t samples_seen_   = 0;
+    double target_acc_sumsq_  = 0.0;
+    size_t target_acc_samples_ = 0;
+};
+
 // encode float32 audio samples as a WAV byte buffer (16-bit PCM)
 static std::string encode_wav(const std::vector<float> & samples, int sample_rate) {
     const int num_channels = 1;
@@ -2113,16 +2224,44 @@ int main(int argc, char ** argv) {
                     streaming_opts sopts;
                     sopts.batch_size = stream_batch_size;
                     sopts.first_batch_size = stream_first_batch_size;
-                    sopts.on_pcm = [&](const float * pcm, size_t n) -> bool {
+
+                    // Loudness AGC: long-prompt drift mitigation. The
+                    // Qwen3-TTS model drifts down in volume on long
+                    // generations (verified upstream — pt drifts the same
+                    // way when max_new_tokens lifted past its default
+                    // cap). Opt OUT via QWEN3_TTS_NO_LOUDNESS_AGC=1.
+                    // Learn target RMS for 5 s, then hold envelope near
+                    // target with 0.4 dB/s slew, ±12 dB max correction.
+                    const bool agc_enabled =
+                        (std::getenv("QWEN3_TTS_NO_LOUDNESS_AGC") == nullptr);
+                    std::shared_ptr<LoudnessAGC> agc =
+                        agc_enabled
+                            ? std::make_shared<LoudnessAGC>((int) wav_sample_rate)
+                            : nullptr;
+
+                    sopts.on_pcm = [&, agc](const float * pcm, size_t n) -> bool {
                         ensure_header();
+                        // Apply AGC into a local buffer so we don't
+                        // mutate the talker's PCM (it may be reused for
+                        // partial-alignment). Only ~2-3 ms / 50 ms chunk
+                        // on this RMS-bound code path.
+                        std::vector<float> pcm_buf;
+                        const float * out_pcm = pcm;
+                        size_t        out_n   = n;
+                        if (agc) {
+                            pcm_buf.assign(pcm, pcm + n);
+                            agc->process(pcm_buf.data(), pcm_buf.size());
+                            out_pcm = pcm_buf.data();
+                            out_n   = pcm_buf.size();
+                        }
                         bool ok = true;
                         if (is_compressed) {
                             std::vector<uint8_t> encoded;
-                            if (!enc->push_pcm(pcm, n, encoded)) return false;
+                            if (!enc->push_pcm(out_pcm, out_n, encoded)) return false;
                             ok = emit_bytes(reinterpret_cast<const char *>(encoded.data()),
                                             encoded.size());
                         } else {
-                            std::string bytes = encode_pcm(std::vector<float>(pcm, pcm + n));
+                            std::string bytes = encode_pcm(std::vector<float>(out_pcm, out_pcm + out_n));
                             ok = emit_bytes(bytes.data(), bytes.size());
                         }
                         if (partial_align_active && wav_sample_rate > 0) {
@@ -2406,6 +2545,20 @@ int main(int argc, char ** argv) {
             } else {
                 tts.save_voice_warmup(voice, result.prefill_cache_key,
                                       result.ref_codes_hash, warmup_path, model_id);
+            }
+        }
+
+        // Apply loudness AGC to the non-streaming result.audio. Streaming
+        // path applies it per-chunk in on_pcm above. Same drift-mitigation
+        // story — Qwen3-TTS drifts down over long generations (model-level,
+        // verified upstream). Opt OUT via QWEN3_TTS_NO_LOUDNESS_AGC=1.
+        if (!result.audio.empty()
+            && std::getenv("QWEN3_TTS_NO_LOUDNESS_AGC") == nullptr) {
+            LoudnessAGC agc(result.sample_rate);
+            constexpr size_t kChunk = 1200; // ~50 ms @ 24 kHz (matches streaming cadence)
+            for (size_t off = 0; off < result.audio.size(); off += kChunk) {
+                const size_t n = std::min(kChunk, result.audio.size() - off);
+                agc.process(result.audio.data() + off, n);
             }
         }
 
