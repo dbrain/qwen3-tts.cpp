@@ -2290,6 +2290,17 @@ void TTSTransformer::build_step_graph_into(struct ggml_context * ctx0,
         struct ggml_tensor * logits_sup = ggml_add(ctx0, pen_logits, state_.suppress_mask_tensor);
         struct ggml_tensor * logits_sample = ggml_reshape_2d(ctx0, logits_sup, V, 1);
 
+        // Debug: optionally expose logits_sup as a graph output so the host
+        // can verify the GPU sampling chain produces the same token from the
+        // same logits. Gated by QWEN3_TTS_GPU_SAMPLE_VERIFY=1.
+        static const bool s_dbg_gpu_sample_verify =
+            std::getenv("QWEN3_TTS_GPU_SAMPLE_VERIFY") != nullptr;
+        if (s_dbg_gpu_sample_verify) {
+            ggml_format_name(logits_sup, "dbg_logits_sup");
+            ggml_set_output(logits_sup);
+            ggml_build_forward_expand(gf, logits_sup);
+        }
+
         struct ggml_tensor * gumbel = nullptr;
         if (sampling->temperature > 0.0f) {
             gumbel = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, sampling->top_k, 1);
@@ -3691,6 +3702,52 @@ bool TTSTransformer::forward_step_sample(const float * step_embd, int32_t n_past
     ggml_backend_tensor_get(sampled, &v, 0, sizeof(int32_t));
     sampled_token_out = v;
 
+    // Debug: when QWEN3_TTS_GPU_SAMPLE_VERIFY=1, re-do the sampling on host
+    // using the GPU-computed logits_sup and the same gumbel buffer. Log any
+    // divergence so we can see if the GPU sampling chain produces a different
+    // token than its host equivalent.
+    {
+        static const bool s_verify =
+            std::getenv("QWEN3_TTS_GPU_SAMPLE_VERIFY") != nullptr;
+        if (s_verify && temperature > 0.0f) {
+            struct ggml_tensor * t_logits_sup = ggml_graph_get_tensor(gf, "dbg_logits_sup");
+            if (t_logits_sup) {
+                const int32_t V = cfg.codec_vocab_size;
+                std::vector<float> host_logits(V);
+                ggml_backend_tensor_get(t_logits_sup, host_logits.data(), 0,
+                                         (size_t) V * sizeof(float));
+                // Scale by 1/T
+                const float inv_T = 1.0f / temperature;
+                for (int32_t i = 0; i < V; ++i) host_logits[i] *= inv_T;
+                // top-K via partial_sort over (value, index) pairs
+                std::vector<std::pair<float, int32_t>> sc(V);
+                for (int32_t i = 0; i < V; ++i) sc[i] = { host_logits[i], i };
+                const int32_t K = std::min<int32_t>(top_k, V);
+                std::partial_sort(sc.begin(), sc.begin() + K, sc.end(),
+                    [](const auto & a, const auto & b) { return a.first > b.first; });
+                // Add the SAME gumbel uniforms used for the GPU graph
+                int32_t host_argmax_idx = 0;
+                float host_argmax_val = -INFINITY;
+                for (int32_t k = 0; k < K; ++k) {
+                    float val = sc[k].first + talker_gumbel_scratch_[k];
+                    if (val > host_argmax_val) {
+                        host_argmax_val = val;
+                        host_argmax_idx = k;
+                    }
+                }
+                int32_t host_token = sc[host_argmax_idx].second;
+                static int s_verify_frame = 0;
+                if (host_token != v) {
+                    fprintf(stderr, "[gpu-verify] DIVERGE f=%d gpu_tok=%d host_tok=%d "
+                            "K=%d  gpu_logit=%g host_logit=%g  gpu_pos_in_topK=?\n",
+                            s_verify_frame, v, host_token, K,
+                            host_logits[v], host_logits[host_token]);
+                }
+                ++s_verify_frame;
+            }
+        }
+    }
+
     state_.cache.n_used = n_past + 1;
     if (!use_step_cache) ggml_backend_sched_reset(state_.sched);
 #ifdef QWEN3_TTS_TIMING
@@ -4704,6 +4761,28 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             for (int i = 0; i < 5; ++i) fprintf(stderr, " %d(%.3f)", sc[i].second, sc[i].first);
             fprintf(stderr, "\n");
         }
+
+        // Drift diagnostic: dump hidden-state L2 norm and cb0 logit stats
+        // every N frames. Logits[] is only populated via the host-fallback
+        // path (frame 0 or QWEN3_TTS_NO_TALKER_GPU_SAMPLE=1). For GPU-sample
+        // path this fires only when sampling drops to host (frame 0).
+        // For long-prompt drift diagnosis on voice=default.
+        {
+            static const int s_dump_norm_every = []() {
+                const char * v = std::getenv("QWEN3_TTS_DUMP_NORM_EVERY");
+                return v ? std::atoi(v) : 0;
+            }();
+            if (s_dump_norm_every > 0 && (frame == 0 || frame % s_dump_norm_every == 0)) {
+                double hnorm = 0.0, hsum = 0.0;
+                for (int h = 0; h < cfg.hidden_size; ++h) {
+                    hnorm += (double)last_hidden_[h] * last_hidden_[h];
+                    hsum  += (double)last_hidden_[h];
+                }
+                hnorm = std::sqrt(hnorm);
+                fprintf(stderr, "[drift-diag] f=%-5d n_past=%-5d hnorm=%8.4f hmean=%+9.5f\n",
+                        frame, n_past, hnorm, hsum / cfg.hidden_size);
+            }
+        }
         int32_t next_token;
         if (gpu_sample_ready) {
             // Sampled by previous iter's forward_step_sample.
@@ -4774,7 +4853,22 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         if (next_token == cfg.codec_eos_id) {
             break;
         }
-        
+
+        // Debug: opt-in cb0 token trace via QWEN3_TTS_DUMP_TOKENS=N
+        // Logs the first N cb0 tokens to stderr with the sampling path used.
+        // Cheap to leave in (one getenv per frame, atoi once).
+        {
+            static const int s_dump_tokens = []() {
+                const char * v = std::getenv("QWEN3_TTS_DUMP_TOKENS");
+                return v ? std::atoi(v) : 0;
+            }();
+            if (s_dump_tokens > 0 && frame < s_dump_tokens) {
+                fprintf(stderr, "[cb0-trace] f=%-4d tok=%-5d path=%s\n",
+                        frame, next_token,
+                        (frame == 0 || !use_talker_gpu_sample) ? "host" : "gpu");
+            }
+        }
+
         frame_codes[0] = next_token;
         generated_cb0_tokens.insert(next_token);
         
