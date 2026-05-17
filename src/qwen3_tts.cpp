@@ -532,7 +532,36 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
     };
     sample_memory("synth/start");
-    
+
+    // Per-request cancel wiring. Install a ggml abort callback that
+    // polls cancel_requested_ between graph nodes. The streaming
+    // frame_callback below also checks the same atomic between AR steps.
+    // The caller (worker reader thread / server watchdog) flips it via
+    // request_cancel() from another thread to interrupt the synth fast.
+    //
+    // NOTE: cancel_requested_ is NOT cleared here — clearing must happen
+    // BEFORE the caller publishes "synth is now running" (e.g. before
+    // the worker stores active_synth_req_id) so a CANCEL_REQ targeting
+    // this synth can't be lost by a clear that races with it. Single-
+    // threaded callers (in-process server before its watchdog starts)
+    // should call clear_cancel() right before this method.
+    //
+    // The previous abort callback (typically none) is restored on
+    // scope exit via the guard below.
+    ggml_abort_callback prev_abort_cb   = abort_cb_;
+    void *              prev_abort_data = abort_data_;
+    set_abort_callback(
+        [](void * p) -> bool {
+            return reinterpret_cast<std::atomic<bool> *>(p)->load(std::memory_order_relaxed);
+        },
+        &cancel_requested_);
+    struct AbortCbRestore {
+        Qwen3TTS *           self;
+        ggml_abort_callback  cb;
+        void *               data;
+        ~AbortCbRestore() { self->set_abort_callback(cb, data); }
+    } abort_restore{this, prev_abort_cb, prev_abort_data};
+
     // Step 2: Tokenize input text and optional instruction prompt
     int64_t t_tokenize_start = get_time_ms();
     std::vector<int32_t> text_tokens = tokenizer_.encode_for_tts(text);
@@ -860,9 +889,19 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
 
         transformer_.set_frame_callback(
-            [stream, &stream_buf, &stream_cb_count, &stream_cb_aborted, n_cb,
+            [this, stream, &stream_buf, &stream_cb_count, &stream_cb_aborted, n_cb,
              &async_voc, &run_vocoder_chunk]
             (int32_t /*frame_idx*/, const int32_t * frame_codes) -> bool {
+                // Cancel between AR steps. The ggml abort callback handles
+                // cancellation INSIDE a step (between graph nodes); this
+                // check catches cancels arriving between the talker step
+                // and the next one, and short-circuits the buffered-batch
+                // path that would otherwise queue more work to the async
+                // vocoder worker.
+                if (cancel_requested_.load(std::memory_order_relaxed)) {
+                    stream_cb_aborted = true;
+                    return false;
+                }
                 if (async_voc.err.load()) {
                     stream_cb_aborted = true;
                     return false;
@@ -1014,7 +1053,11 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     }
     if (!generate_ok) {
         if (result.error_msg.empty()) {
-            result.error_msg = "Failed to generate speech codes: " + transformer_.get_error();
+            if (cancel_requested_.load(std::memory_order_relaxed)) {
+                result.error_msg = "Cancelled by caller";
+            } else {
+                result.error_msg = "Failed to generate speech codes: " + transformer_.get_error();
+            }
         }
         return result;
     }

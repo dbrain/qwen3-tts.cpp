@@ -39,7 +39,15 @@ enum class WorkerFrame : uint32_t {
     AUDIO_FRAME  = 0x22,  // W→P  streaming chunk (P2)
     SYNTH_DONE   = 0x23,  // W→P  end-of-stream + usage stats (P2)
     SYNTH_ERR    = 0x2F,  // W→P  {"error": str}
-    ABORT_REQ    = 0x30,  // P→W  {"req_id": u32}    (P2)
+    // CANCEL_REQ: parent asks worker to abort the currently-running synth
+    // (req_id is matched against the in-flight SYNTH_REQ's req_id; a
+    // mismatch is treated as a no-op so stale cancels can't accidentally
+    // kill the next request). Empty payload; req_id field carries the
+    // target. Worker still emits SYNTH_DONE (with success=false) so the
+    // parent drain loop terminates cleanly. The worker is multiplexed
+    // via a reader thread so CANCEL_REQ is observed while synth is
+    // actively running on the main thread.
+    CANCEL_REQ   = 0x30,  // P→W   empty payload; hdr.req_id = target synth's req_id
     EXTRACT_EMBED_REQ  = 0x50, // P→W  {"filepath": str}  (voice rego)
     EXTRACT_EMBED_RESP = 0x51, // W→P  {"ok": bool, "error": str, "n_floats": int} + raw f32
     ENCODE_CODES_REQ   = 0x52, // P→W  {"n_samples": int} + raw f32 samples

@@ -2115,6 +2115,13 @@ int main(int argc, char ** argv) {
                         sink.done();
                         return false;
                     }
+                    // Clear any stale cancel state from a prior request
+                    // before the watchdog can fire. In-process tts is a
+                    // long-lived shared instance; the cancel flag isn't
+                    // self-clearing across requests.
+                    if (!worker_session) {
+                        this_tts->clear_cancel();
+                    }
 
                     // wav header up front (audio mode only). for SSE, the wav
                     // bytes per-delta are raw pcm — clients reconstruct wav.
@@ -2264,7 +2271,41 @@ int main(int argc, char ** argv) {
                             ? std::make_shared<LoudnessAGC>((int) wav_sample_rate)
                             : nullptr;
 
+                    // Cancellation plumbing. Two signals feed `cancel`:
+                    //   (a) `on_pcm` sees `sink.write()` return false (the
+                    //       client's TCP send buffer broke); fires inline.
+                    //   (b) the watchdog thread polls `sink.is_writable()`
+                    //       every ~30 ms — this catches disconnects that
+                    //       happen WHILE the talker is busy generating
+                    //       (and no PCM is being pushed to the sink yet),
+                    //       which is the "I hit seek 200 ms in" case.
+                    // On flip we (1) tell the in-process Qwen3TTS or the
+                    // worker session to abort fast (ggml abort callback +
+                    // frame_callback short-circuit), (2) tell the aligner
+                    // session to stop chewing on partial PCM, (3) let the
+                    // partial-reader thread exit.
+                    std::atomic<bool> cancel{false};
+                    auto dispatch_cancel = [&]() {
+                        if (cancel.exchange(true)) return; // already cancelled
+                        if (worker_session) {
+                            worker_session->cancel_in_flight();
+                        } else {
+                            this_tts->request_cancel();
+                        }
+                        // Stop the partial-reader thread from emitting
+                        // further SSE events on a dead sink, and let any
+                        // in-flight aligner request drain naturally.
+                        // push_partial_pcm in on_pcm is gated below.
+                    };
+
                     sopts.on_pcm = [&, agc](const float * pcm, size_t n) -> bool {
+                        // Fast path on cancel: stop pushing audio to the
+                        // (closed) sink and stop feeding the aligner —
+                        // the synth call itself will unwind on the next
+                        // ggml/frame_callback poll.
+                        if (cancel.load(std::memory_order_relaxed)) {
+                            return false;
+                        }
                         ensure_header();
                         // Apply AGC into a local buffer so we don't
                         // mutate the talker's PCM (it may be reused for
@@ -2282,14 +2323,26 @@ int main(int argc, char ** argv) {
                         bool ok = true;
                         if (is_compressed) {
                             std::vector<uint8_t> encoded;
-                            if (!enc->push_pcm(out_pcm, out_n, encoded)) return false;
+                            if (!enc->push_pcm(out_pcm, out_n, encoded)) {
+                                dispatch_cancel();
+                                return false;
+                            }
                             ok = emit_bytes(reinterpret_cast<const char *>(encoded.data()),
                                             encoded.size());
                         } else {
                             std::string bytes = encode_pcm(std::vector<float>(out_pcm, out_pcm + out_n));
                             ok = emit_bytes(bytes.data(), bytes.size());
                         }
-                        if (partial_align_active && wav_sample_rate > 0) {
+                        if (!ok) {
+                            // sink.write() failed → client gone. Kick the
+                            // cancel pipeline immediately so the talker
+                            // doesn't keep generating for the next batch
+                            // and the worker stops on the next graph poll.
+                            dispatch_cancel();
+                            return false;
+                        }
+                        if (partial_align_active && wav_sample_rate > 0
+                            && !cancel.load(std::memory_order_relaxed)) {
                             const int64_t this_chunk_ms = (int64_t) ((n * 1000ll) / (size_t) wav_sample_rate);
                             const int64_t new_total = audio_offset_ms.fetch_add(this_chunk_ms,
                                                                                 std::memory_order_relaxed)
@@ -2308,6 +2361,37 @@ int main(int argc, char ** argv) {
                         }
                         return ok;
                     };
+
+                    // Disconnect watchdog. Polls sink.is_writable() at
+                    // ~30 ms (httplib's wait_writable does a non-blocking
+                    // POLLOUT check on the underlying socket — cheap). On
+                    // disconnect, dispatch_cancel() fires once. Detection
+                    // window is bounded by the poll interval; total cancel
+                    // latency is ~poll_interval + one ggml graph eval
+                    // (~10-30 ms on RTX 3060).
+                    //
+                    // The thread must stop before this lambda returns —
+                    // sink (a DataSink&) becomes invalid right after.
+                    // wd_stop is flipped by the join guard below.
+                    std::atomic<bool> wd_stop{false};
+                    std::thread watchdog_thread([&sink, &wd_stop, &dispatch_cancel]() {
+                        while (!wd_stop.load(std::memory_order_relaxed)) {
+                            if (sink.is_writable && !sink.is_writable()) {
+                                fprintf(stderr, "tts-stream-watchdog: sink not writable -> cancel\n");
+                                dispatch_cancel();
+                                return;
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                        }
+                    });
+                    struct WatchdogJoinGuard {
+                        std::atomic<bool> & stop;
+                        std::thread & t;
+                        ~WatchdogJoinGuard() {
+                            stop.store(true, std::memory_order_relaxed);
+                            if (t.joinable()) t.join();
+                        }
+                    } watchdog_join{wd_stop, watchdog_thread};
 
                     tts_result result;
                     if (worker_session) {
@@ -2364,6 +2448,19 @@ int main(int argc, char ** argv) {
                     // on_pcm), emit speech.audio.alignment.final. Errors
                     // surface as an alignment.error event rather than
                     // bringing down the audio stream.
+                    //
+                    // On cancel we skip the FINAL_REQ round-trip entirely
+                    // — the client is gone, the in-flight aligner request
+                    // (if any) drains naturally, and we release
+                    // aligner_lock immediately so the next request can
+                    // grab it.
+                    if (partial_align_active && aligner_session
+                        && cancel.load(std::memory_order_relaxed)) {
+                        partial_reader_stop.store(true, std::memory_order_relaxed);
+                        if (partial_reader_thread.joinable()) partial_reader_thread.join();
+                        if (aligner_lock.owns_lock()) aligner_lock.unlock();
+                        partial_align_active = false;
+                    }
                     if (partial_align_active && aligner_session) {
                         partial_reader_stop.store(true, std::memory_order_relaxed);
                         if (partial_reader_thread.joinable()) partial_reader_thread.join();

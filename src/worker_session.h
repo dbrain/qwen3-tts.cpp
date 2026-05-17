@@ -227,6 +227,16 @@ public:
                                   std::vector<AlignedWord> & out_words,
                                   AlignProfile & out_profile);
 
+    // Send CANCEL_REQ to the worker for the currently in-flight synth.
+    // Idempotent: if no synth is in flight, this is a no-op. Safe to
+    // call from any thread (uses a separate send_mutex_ so it doesn't
+    // contend with the synth call holding io_mutex_). Worker matches
+    // req_id, sets request_cancel() on its Qwen3TTS instance, and the
+    // talker AR loop / ggml abort callback bails within ~one graph
+    // eval. Worker still emits SYNTH_DONE (with success=false) so the
+    // parent drain loop terminates cleanly.
+    void cancel_in_flight();
+
 private:
     // Send LOAD_REQ, wait for LOAD_RESP. Caller must hold io_mutex_.
     bool send_load_req_locked(const WorkerLoadConfig & cfg);
@@ -257,8 +267,19 @@ private:
     int                        fd_  = -1;
     int                        sample_rate_ = 0;
     mutable std::mutex         io_mutex_;
+    // Held only by cancel_in_flight() while it writes CANCEL_REQ to fd_.
+    // Distinct from io_mutex_ so cancel can be issued from another
+    // thread while io_mutex_ is held by the synth's recv loop. The
+    // synth path itself only writes SYNTH_REQ once at the very start
+    // (before recv begins), so in practice the send_mutex_ is uncontended.
+    mutable std::mutex         send_mutex_;
     std::string                last_error_;
     std::atomic<uint32_t>      next_req_id_{1};
+    // Set by do_synth_locked while a SYNTH_REQ is in flight (between the
+    // SYNTH_REQ send and the final SYNTH_DONE/SYNTH_RESP/SYNTH_ERR).
+    // Read by cancel_in_flight() to know which req_id to target. 0 means
+    // no synth in flight → cancel is a no-op.
+    std::atomic<uint32_t>      current_synth_req_id_{0};
 
     // Phase-2 streaming-alignment session state. Set by
     // begin_streaming_align; reset on finalize. Holds the parent-side

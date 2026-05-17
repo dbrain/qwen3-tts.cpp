@@ -2,16 +2,21 @@
 
 #include "worker_session.h"
 
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <csignal>
 #include "ggml.h"
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <mutex>
 #include <nlohmann/json.hpp>
 #include <poll.h>
 #include <sys/wait.h>
+#include <thread>
 #include <unistd.h>
 #if defined(__linux__)
 #  include <sys/prctl.h>
@@ -271,6 +276,31 @@ void WorkerSession::shutdown() {
     kill_worker_locked();
 }
 
+void WorkerSession::cancel_in_flight() {
+    // Snapshot req_id; if no synth is in flight, drop.
+    uint32_t req_id = current_synth_req_id_.load(std::memory_order_acquire);
+    if (req_id == 0) {
+        return;
+    }
+    // Snapshot fd_ under a quick check — worker may have been killed
+    // between our load above and the send below. send_mutex_ protects
+    // the wire send from interleaving with other concurrent senders;
+    // we deliberately do NOT take io_mutex_ here because the synth
+    // call we're trying to cancel is the one holding it.
+    int fd = fd_;
+    if (fd < 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> slk(send_mutex_);
+    IpcError e = send_frame(fd, WorkerFrame::CANCEL_REQ, req_id, nullptr, 0);
+    if (e != IpcError::OK) {
+        fprintf(stderr, "worker-session: CANCEL_REQ send failed (req_id=%u): %s\n",
+                req_id, ipc_error_str(e));
+        return;
+    }
+    fprintf(stderr, "worker-session: CANCEL_REQ sent (req_id=%u)\n", req_id);
+}
+
 bool WorkerSession::send_load_req_locked(const WorkerLoadConfig & cfg) {
     json req = {
         {"model",              cfg.model},
@@ -402,12 +432,26 @@ tts_result WorkerSession::do_synth_locked(
                                       streaming ? stream_batch_size : 0,
                                       streaming ? stream_first_batch_size : 0);
     uint32_t req_id = next_req_id_.fetch_add(1);
-    IpcError e = send_frame(fd_, WorkerFrame::SYNTH_REQ, req_id, payload);
-    if (e != IpcError::OK) {
-        fail.error_msg = std::string("SYNTH_REQ send failed: ") + ipc_error_str(e);
-        kill_worker_locked();
-        return fail;
+    {
+        std::lock_guard<std::mutex> slk(send_mutex_);
+        IpcError e0 = send_frame(fd_, WorkerFrame::SYNTH_REQ, req_id, payload);
+        if (e0 != IpcError::OK) {
+            fail.error_msg = std::string("SYNTH_REQ send failed: ") + ipc_error_str(e0);
+            kill_worker_locked();
+            return fail;
+        }
     }
+    // Publish req_id AFTER the wire send so any concurrent
+    // cancel_in_flight() that fires before the worker has even seen
+    // SYNTH_REQ would be a no-op (current_synth_req_id_=0). Clear on
+    // every return path so a late cancel after we already returned
+    // doesn't get sent.
+    current_synth_req_id_.store(req_id, std::memory_order_release);
+    struct CurrentSynthGuard {
+        std::atomic<uint32_t> & cur;
+        ~CurrentSynthGuard() { cur.store(0, std::memory_order_release); }
+    } current_synth_guard{current_synth_req_id_};
+    IpcError e = IpcError::OK;
 
     if (!streaming) {
         // Non-streaming: one SYNTH_RESP frame contains the whole audio.
@@ -1128,17 +1172,104 @@ int run_worker_loop(int fd) {
     qwen3_asr_context * fa_ctx = nullptr;
 #endif
 
+    // ─── Reader thread (control-frame multiplexer) ──────────────────────
+    // The main thread spends most of its time in synth() and can't poll
+    // the socket while doing so. A reader thread owns recv_frame()
+    // exclusively: control frames (CANCEL_REQ, SHUTDOWN) are dispatched
+    // immediately, everything else queues for the main thread.
+    //
+    // Sends stay on the main thread → no send_mutex needed. The reader
+    // thread never writes to the socket; main thread never reads.
+    struct WorkerCtrl {
+        std::deque<std::pair<FrameHeader, std::vector<uint8_t>>> work_queue;
+        std::mutex                queue_mutex;
+        std::condition_variable   queue_cv;
+        // Reader thread terminal states. main loop exits when reader_done
+        // is true AND work_queue is drained.
+        std::atomic<bool>     reader_done{false};       // EOF or SHUTDOWN seen
+        int                   reader_exit_code = 0;     // 0 = clean
+        // Cancel coordination. Main thread publishes the in-flight
+        // synth's req_id BEFORE entering synth() and clears AFTER. The
+        // reader compares incoming CANCEL_REQ.req_id against this; a
+        // mismatch (or 0 = no synth in flight) is logged-and-dropped.
+        // Release/acquire on active_synth_req_id pairs with main thread's
+        // tts.clear_cancel() so a cancel reaching the reader after the
+        // store is guaranteed to see the cleared flag.
+        std::atomic<uint32_t> active_synth_req_id{0};
+    };
+    WorkerCtrl ctrl;
+
+    std::thread reader_thread([fd, &ctrl, &tts]() {
+        while (true) {
+            FrameHeader hdr{};
+            std::vector<uint8_t> payload;
+            IpcError e = recv_frame(fd, &hdr, &payload);
+            if (e == IpcError::EofClean) {
+                fprintf(stderr, "worker-reader: parent EOF, exiting\n");
+                ctrl.reader_done.store(true);
+                ctrl.queue_cv.notify_all();
+                return;
+            }
+            if (e != IpcError::OK) {
+                fprintf(stderr, "worker-reader: recv_frame failed: %s\n",
+                        ipc_error_str(e));
+                ctrl.reader_exit_code = 3;
+                ctrl.reader_done.store(true);
+                ctrl.queue_cv.notify_all();
+                return;
+            }
+            WorkerFrame ft = static_cast<WorkerFrame>(hdr.type);
+            if (ft == WorkerFrame::CANCEL_REQ) {
+                uint32_t active = ctrl.active_synth_req_id.load(std::memory_order_acquire);
+                if (active != 0 && active == hdr.req_id) {
+                    tts.request_cancel();
+                    fprintf(stderr, "worker-reader: CANCEL_REQ req_id=%u accepted (active=%u)\n",
+                            hdr.req_id, active);
+                } else {
+                    fprintf(stderr, "worker-reader: CANCEL_REQ req_id=%u dropped (active=%u)\n",
+                            hdr.req_id, active);
+                }
+                continue;
+            }
+            if (ft == WorkerFrame::SHUTDOWN) {
+                // SHUTDOWN goes through the queue so the main thread can
+                // emit its log line and return cleanly without racing the
+                // reader's exit. Reader marks done so main wakes if idle.
+                std::lock_guard<std::mutex> lk(ctrl.queue_mutex);
+                ctrl.work_queue.emplace_back(hdr, std::move(payload));
+                ctrl.reader_done.store(true);
+                ctrl.queue_cv.notify_all();
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lk(ctrl.queue_mutex);
+                ctrl.work_queue.emplace_back(hdr, std::move(payload));
+            }
+            ctrl.queue_cv.notify_all();
+        }
+    });
+
+    // Reader thread is joined on every return path via this guard.
+    struct ReaderJoinGuard {
+        std::thread & t;
+        ~ReaderJoinGuard() { if (t.joinable()) t.join(); }
+    } reader_join{reader_thread};
+
     while (true) {
         FrameHeader hdr{};
         std::vector<uint8_t> payload;
-        IpcError e = recv_frame(fd, &hdr, &payload);
-        if (e == IpcError::EofClean) {
-            fprintf(stderr, "worker: parent EOF, exiting cleanly\n");
-            return 0;
-        }
-        if (e != IpcError::OK) {
-            fprintf(stderr, "worker: recv_frame failed: %s\n", ipc_error_str(e));
-            return 3;
+        {
+            std::unique_lock<std::mutex> lk(ctrl.queue_mutex);
+            ctrl.queue_cv.wait(lk, [&] {
+                return !ctrl.work_queue.empty() || ctrl.reader_done.load();
+            });
+            if (ctrl.work_queue.empty()) {
+                // Reader done + nothing left → exit.
+                return ctrl.reader_exit_code;
+            }
+            hdr     = ctrl.work_queue.front().first;
+            payload = std::move(ctrl.work_queue.front().second);
+            ctrl.work_queue.pop_front();
         }
 
         switch (static_cast<WorkerFrame>(hdr.type)) {
@@ -1250,6 +1381,21 @@ int run_worker_loop(int fd) {
                         break;
                     }
                 }
+
+                // Cancel coordination: clear stale cancel state from any
+                // previous request BEFORE publishing this request's
+                // req_id. The release-store on active_synth_req_id pairs
+                // with the reader thread's acquire-load — a CANCEL_REQ
+                // arriving after this store is guaranteed to see the
+                // cleared flag, so it can flip request_cancel() without
+                // racing our clear. RAII guard ensures we unpublish on
+                // every return path (including from inside this case).
+                tts.clear_cancel();
+                ctrl.active_synth_req_id.store(hdr.req_id, std::memory_order_release);
+                struct SynthActiveGuard {
+                    std::atomic<uint32_t> & active;
+                    ~SynthActiveGuard() { active.store(0, std::memory_order_release); }
+                } synth_active_guard{ctrl.active_synth_req_id};
 
                 // Reset the FA scratch buffer for each new synth so an
                 // ALIGN_REQ after a failed/aborted synth can't accidentally

@@ -6,6 +6,7 @@
 #include "audio_codec_encoder.h"
 #include "audio_tokenizer_decoder.h"
 
+#include <atomic>
 #include <string>
 #include <vector>
 #include <functional>
@@ -215,6 +216,24 @@ public:
     // The callback is stored and automatically re-applied after lazy load/reload.
     void set_abort_callback(ggml_abort_callback callback, void * data);
 
+    // Request cancellation of the currently running synth (thread-safe).
+    // Wired into both the ggml abort callback (poll between graph nodes →
+    // interrupts current AR step at sub-token granularity) and the
+    // streaming frame callback (bails between talker AR steps so the
+    // async vocoder worker stops too). Cancelled synths return
+    // tts_result with success=false, error_msg="Cancelled by caller".
+    //
+    // The caller is responsible for calling clear_cancel() BEFORE
+    // starting a new synth — synth() does NOT auto-clear because the
+    // worker dispatch thread publishes its req_id only after clearing,
+    // which is what makes cancel safe to issue across requests
+    // (req_id-matched in the worker reader thread).
+    void request_cancel() { cancel_requested_.store(true, std::memory_order_relaxed); }
+    void clear_cancel()   { cancel_requested_.store(false, std::memory_order_relaxed); }
+    bool is_cancel_requested() const {
+        return cancel_requested_.load(std::memory_order_relaxed);
+    }
+
     // Get error message
     const std::string & get_error() const { return error_msg_; }
 
@@ -320,6 +339,11 @@ private:
     tts_progress_callback_t progress_callback_;
     ggml_abort_callback abort_cb_ = nullptr;
     void * abort_data_ = nullptr;
+
+    // Per-request cancel flag. synth() clears at entry, installs a
+    // ggml abort callback that reads it, and the streaming frame
+    // callback checks it between AR steps.
+    std::atomic<bool> cancel_requested_{false};
 
     // ICL warmup vocoder-state cache. Keyed by FNV-1a hash of the ref_codes
     // int32 byte stream. On a hit we restore the streaming decoder state
