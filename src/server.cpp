@@ -2581,7 +2581,13 @@ int main(int argc, char ** argv) {
                                 warmup_path, model_id);
                         }
                     }
-                    return false;
+                    // Returning true tells cpp-httplib "I'm done emitting"
+                    // (sink.done() set data_available=false → loop exits
+                    // cleanly). Returning false would mean "cancel" — which
+                    // makes cpp-httplib write_content_chunked return false
+                    // → process_request returns false → the keep-alive
+                    // socket is dropped on the very next iteration.
+                    return true;
                 });
             return;
         }
@@ -2755,7 +2761,7 @@ int main(int argc, char ** argv) {
                     }
                     sink.write(body_bytes.data(), body_bytes.size());
                     sink.done();
-                    return false;
+                    return true; // cpp-httplib: true = "no more data", false = cancel
                 });
             return;
         }
@@ -2837,7 +2843,7 @@ int main(int argc, char ** argv) {
                     }
                     sink.write(done_frame.data(),  done_frame.size());
                     sink.done();
-                    return false;
+                    return true; // cpp-httplib: true = "no more data", false = cancel
                 });
             return;
         }
